@@ -425,3 +425,39 @@ def write_pairs(s1_ids, q_ids, s1_rows, q_rows, col, path):
     for u, a, b in zip(uniq, start, end):
         lists[u] = ",".join(q_ids[q[a:b]])
     pd.DataFrame({"source1_entity_id": s1_ids, col: lists}).to_csv(path, sep="\t", index=False)
+
+
+def best_per_query(cand, p):
+    """One row per query: its highest-probability S1 (q, s1, p)."""
+    d = pd.DataFrame({"q": cand["q"].values, "s1": cand["s1"].values,
+                      "p": np.asarray(p, dtype=np.float32)})
+    return d.sort_values("p", ascending=False, kind="stable").drop_duplicates("q")
+
+
+def decide_sets(top, p_min=0.05, power=1.0):
+    """Set-level decision tuned for macro F0.5 (replaces a single global threshold).
+
+    top: best_per_query output. For each S1, its queries are sorted by p and we keep the
+    top-m (m = 0..n) maximising the plug-in expected F0.5 of that S1:
+        m > 0: 1.25*TP / (1.25*TP + 0.25*(T-TP) + (m-TP)), TP = sum of kept p, T = sum of all p
+        m = 0: P(no true match) = prod(1 - p)
+    So a lone p=0.5 match on an otherwise empty S1 is dropped (a false merge on a singleton
+    costs a full 1.0), while the same p next to confident matches may be kept.
+    power < 1 inflates / > 1 deflates probabilities (calibration knob, tune on dev)."""
+    d = top[top["p"] >= p_min][["q", "s1", "p"]].copy()
+    if d.empty:
+        return d
+    d["p"] = np.clip(d["p"].values.astype(np.float64), 1e-6, 1 - 1e-6) ** power
+    d = d.sort_values(["s1", "p"], ascending=[True, False], kind="stable").reset_index(drop=True)
+    g = d.groupby("s1")["p"]
+    tp = g.cumsum().values
+    m = (g.cumcount() + 1).values
+    T = g.transform("sum").values
+    d["f_m"] = 1.25 * tp / (1.25 * tp + 0.25 * (T - tp) + (m - tp))
+    d["m"] = m
+    f0 = np.exp(np.log1p(-d["p"]).groupby(d["s1"]).sum())
+    best = d.loc[d.groupby("s1")["f_m"].idxmax(), ["s1", "m", "f_m"]].set_index("s1")
+    keep_m = pd.Series(np.where(best["f_m"].values > f0.reindex(best.index).values,
+                                best["m"].values, 0), index=best.index)
+    d = d[d["m"].values <= d["s1"].map(keep_m).values]
+    return d[["q", "s1", "p"]].reset_index(drop=True)
