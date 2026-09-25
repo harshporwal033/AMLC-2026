@@ -625,3 +625,131 @@ def second_choice_features(top, second):
     return pd.DataFrame({"p2": p2, "p_gap12": d["p"].values - p2,
                          "alt_claim_max": alt, "alt_margin": p2 - alt},
                         index=top.index).astype(np.float32)
+
+
+# ---------------------------------------------------------------- dev set for training
+def load_dev(prep_dir, dev_cand_path, dev_mask_path, true_s1_path, frac=1.0, seed=0):
+    """Loads the saved dev set with only the records it needs (low RAM).
+
+    frac < 1 keeps a random share of the dev S1 entities (plus every query that has one of
+    them as its true match or in its top-2 of any view): a faster set for trying ideas
+    whose scores are comparable with the full dev set.
+    Returns dict: cand (q / s1 remapped to rows of Q / S1 below), Q, S1, true_s1 (row in S1
+    or NaN), dev (bool per S1 row, entities to score), true_cnt, qs (query stats)."""
+    cand = pd.read_parquet(dev_cand_path)
+    dev_g = np.load(dev_mask_path)
+    ts_g = np.load(true_s1_path)
+    if frac < 1:
+        keep = np.flatnonzero(dev_g)
+        keep = np.random.default_rng(seed).choice(keep, max(1, int(len(keep) * frac)), replace=False)
+        dev_g = np.zeros_like(dev_g); dev_g[keep] = True
+        rank_cols = [c for c in cand.columns if c.endswith("_rank")]
+        near = np.zeros(len(cand), bool)
+        for c in rank_cols:
+            near |= cand[c].values <= 2
+        tq = ts_g[cand["q"].values]
+        is_dev_true = np.isfinite(tq) & dev_g[np.nan_to_num(tq, nan=0).astype(np.int64)]
+        touch = np.unique(cand["q"].values[(near & dev_g[cand["s1"].values]) | is_dev_true])
+        cand = cand[np.isin(cand["q"].values, touch)]
+    uq = np.unique(cand["q"].values)
+    s1_all = pd.read_parquet(f"{prep_dir}/train_s1.parquet")
+    vocab = name_vocab(s1_all)
+    us = np.unique(np.concatenate([cand["s1"].values, np.flatnonzero(dev_g)]))
+    S1 = s1_all.iloc[us].reset_index(drop=True); del s1_all
+    Q = pd.concat([pd.read_parquet(f"{prep_dir}/train_s{k}.parquet") for k in (2, 3)], ignore_index=True)
+    Q = Q.iloc[uq].reset_index(drop=True)
+    for d in (Q, S1):
+        d["both_n"] = d["name_n"] + " " + d["addr_n"]
+    s1_map = np.full(len(dev_g), -1, np.int64); s1_map[us] = np.arange(len(us))
+    q_map = np.full(len(ts_g), -1, np.int64); q_map[uq] = np.arange(len(uq))
+    cand = cand.assign(q=q_map[cand["q"].values].astype(np.int32),
+                       s1=s1_map[cand["s1"].values].astype(np.int32))
+    cand = cand.sort_values(["q", "s1"]).reset_index(drop=True)
+    t = ts_g[uq]
+    t_sub = np.where(np.isfinite(t), s1_map[np.nan_to_num(t, nan=0).astype(np.int64)], -1)
+    true_s1 = np.where(t_sub >= 0, t_sub, np.nan).astype(np.float64)
+    cand["is_true"] = cand["s1"].values == true_s1[cand["q"].values]
+    dev = dev_g[us]
+    true_cnt = np.bincount(true_s1[np.isfinite(true_s1)].astype(np.int64), minlength=len(S1))
+    return {"cand": cand, "Q": Q, "S1": S1, "true_s1": true_s1, "dev": dev,
+            "true_cnt": true_cnt, "qs": query_stats(Q, vocab)}
+
+
+def build_features_chunked(cand, Q, S1, qs, qinfo=None, sinfo=None, chunk_q=200_000):
+    """build_features over query chunks (cand sorted by q): same result, far less peak RAM."""
+    qv = cand["q"].values
+    uq = np.unique(qv)
+    parts = []
+    for j in range(0, len(uq), chunk_q):
+        lo = np.searchsorted(qv, uq[j])
+        hi = np.searchsorted(qv, uq[min(j + chunk_q, len(uq)) - 1], side="right")
+        parts.append(build_features(cand.iloc[lo:hi].reset_index(drop=True), Q, S1, qs, qinfo, sinfo))
+    return pd.concat(parts, ignore_index=True)
+
+
+def run_two_stage(D, w_decoy=1.9, out_dir=None, params=LGB_PARAMS, verbose=True):
+    """Stage 1 (pair model) + stage 2 (competition / runner-up model) on a load_dev() set.
+
+    Scores are "test-like": decoy false matches count w_decoy times (test has ~1.9x more
+    decoys per S1 than train); decoy rows are up-weighted the same way in training.
+    Picks the better stage and the best decision rule on dev; saves models if out_dir."""
+    import json
+    import os
+    cand, Q, S1, true_s1, dev, true_cnt = (D[k] for k in ("cand", "Q", "S1", "true_s1", "dev", "true_cnt"))
+    t = time.time()
+    F = build_features_chunked(cand, Q, S1, D["qs"], record_info(Q), record_info(S1))
+    if verbose:
+        print(f"features {F.shape} in {time.time() - t:.0f}s", flush=True)
+    y = cand["is_true"].values.astype(np.int8)
+    tq_c = true_s1[cand["q"].values]
+    grp = np.where(np.isfinite(tq_c), tq_c, -(cand["q"].values + 1.0)).astype(np.int64)
+
+    def score(a):
+        tq = true_s1[a["q"].values]
+        return macro_f05(a["s1"].values, a["s1"].values == tq, true_cnt, dev,
+                         fp_w=np.where(np.isfinite(tq), 1.0, w_decoy))[:3]
+
+    def apply(top, rule):
+        return top[top["p"] >= rule["thr"]] if rule["mode"] == "thr" else decide_sets(top, power=rule["power"])
+
+    def sweep(top, label):
+        rules = [{"mode": "thr", "thr": float(t)} for t in np.round(np.arange(0.3, 0.96, 0.05), 2)]
+        rules += [{"mode": "sets", "power": pw} for pw in (1.0, 1.2, 1.5, 2.0)]
+        res = [(score(apply(top, r)), r) for r in rules]
+        (f, P, R), rule = max(res, key=lambda x: x[0][0])
+        if verbose:
+            print(f"{label}: test-like macro F0.5 {f:.4f} | P {P:.4f} R {R:.4f} | rule {rule}", flush=True)
+        return f, rule
+
+    w1 = np.where(np.isfinite(tq_c), 1.0, w_decoy).astype(np.float32)
+    oof1, m1 = train_oof(F, y, grp, params, weight=w1)
+    top = best_per_query(cand, oof1)
+    f1, rule1 = sweep(top, "STAGE 1")
+
+    X2 = pd.concat([F.iloc[top["row"].values].reset_index(drop=True),
+                    reverse_features(top).reset_index(drop=True),
+                    second_choice_features(top, second_per_query(cand, oof1)).reset_index(drop=True)],
+                   axis=1)
+    X2["p1"] = top["p"].values
+    del F
+    y2 = cand["is_true"].values[top["row"].values].astype(np.int8)
+    mask = dev[top["s1"].values]
+    tq_t = true_s1[top["q"].values]
+    w2 = np.where(np.isfinite(tq_t), 1.0, w_decoy).astype(np.float32)
+    oof2, m2 = train_oof(X2[mask].reset_index(drop=True), y2[mask], top["s1"].values[mask], params,
+                         weight=w2[mask])
+    f2, rule2 = sweep(top[mask].assign(p=oof2), "STAGE 2")
+    imp = pd.Series(m2.feature_importance("gain"), index=X2.columns).sort_values(ascending=False)
+    if verbose:
+        print("stage-2 top features:", (imp / imp.sum()).head(12).round(3).to_dict())
+    use2 = f2 > f1
+    cfg = {"f1": list(m1.feature_name()), "f2": list(X2.columns), "stage2": bool(use2),
+           "rule": rule2 if use2 else rule1, "w_decoy": w_decoy,
+           "dev_f05_stage1": float(f1), "dev_f05_stage2": float(f2)}
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        m1.save_model(f"{out_dir}/lgb1.txt"); m2.save_model(f"{out_dir}/lgb2.txt")
+        json.dump(cfg, open(f"{out_dir}/config2.json", "w"))
+        if verbose:
+            print(f"saved {out_dir} -> stage {'2' if use2 else '1'}, rule {cfg['rule']}")
+    return cfg
