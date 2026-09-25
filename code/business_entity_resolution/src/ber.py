@@ -11,6 +11,7 @@ Country is only used to partition the search (every true pair shares a country);
 it is never a model feature, so unseen countries (France) work unchanged.
 """
 import re
+import time
 from collections import Counter
 from multiprocessing import Pool
 
@@ -92,30 +93,59 @@ def load(path):
 
 
 # ---------------------------------------------------------------- blocking
-CHAR3 = dict(analyzer="char_wb", ngram_range=(3, 3), min_df=2, sublinear_tf=True, dtype=np.float32)
-VIEWS = {
-    "name": ("name_n", CHAR3),
-    "addr": ("addr_n", CHAR3),
-    "word": ("both_n", dict(analyzer="word", token_pattern=r"\S+", min_df=1,
-                            sublinear_tf=True, dtype=np.float32)),
-}
+def make_views(word_max_df=0.02, char_max_df=0.05):
+    """max_df drops words / n-grams present in more than that share of S1 records of a
+    country. Very common features ("st", " rd", "ing") barely identify a business but make
+    the sparse top-K search very slow, because their posting lists cover most of the index.
+    The word view runs first (it is fastest and strongest); dict order matters."""
+    char3 = dict(analyzer="char_wb", ngram_range=(3, 3), min_df=2, max_df=char_max_df,
+                 sublinear_tf=True, dtype=np.float32)
+    word = dict(analyzer="word", token_pattern=r"\S+", min_df=1, max_df=word_max_df,
+                sublinear_tf=True, dtype=np.float32)
+    return {"word": ("both_n", word), "name": ("name_n", char3), "addr": ("addr_n", char3)}
+
+
+VIEWS = make_views()
 VIEW_K = {"word": 10, "name": 5, "addr": 5}   # final candidate set fed to the model
+CHAR_FRAC = 0.3   # share of queries (weakest word-view margin) that also get the char views
+
+
+def _fit(params, docs):
+    vec = TfidfVectorizer(**params)
+    try:
+        return vec, vec.fit_transform(docs).T.tocsr()
+    except ValueError:                      # tiny index: max_df pruned everything
+        vec = TfidfVectorizer(**{**params, "max_df": 1.0, "min_df": 1})
+        return vec, vec.fit_transform(docs).T.tocsr()
 
 
 class Blocker:
-    """Fits one TF-IDF index per (country, view) over S1; queries return top-k per view."""
+    """Fits one TF-IDF index per (country, view) over S1; queries return top-k per view.
 
-    def __init__(self, S1, views=VIEWS, n_threads=4):
-        self.views, self.nt, self.idx = views, n_threads, {}
+    The word view is run for every query. The two char-3gram views (typos, transliteration,
+    junk names) are slower, so they only run for "weak" queries: non-Latin names, queries
+    with no word hit, and the char_frac share with the smallest word-view top1-top2 margin."""
+
+    def __init__(self, S1, views=VIEWS, n_threads=4, char_frac=CHAR_FRAC):
+        self.views, self.nt, self.char_frac, self.idx = views, n_threads, char_frac, {}
         for c in pd.unique(S1["country"]):
             rows = np.flatnonzero(S1["country"].values == c)
-            fitted = {}
-            for v, (col, params) in views.items():
-                vec = TfidfVectorizer(**params)
-                fitted[v] = (vec, vec.fit_transform(S1[col].values[rows]).T.tocsr())
-            self.idx[c] = (rows, fitted)
+            self.idx[c] = (rows, {v: _fit(params, S1[col].values[rows])
+                                  for v, (col, params) in views.items()})
 
-    def query(self, Q, k=20, q_chunk=200_000, view_k=None):
+    def _weak(self, word_cand, Q, qc):
+        d = word_cand.sort_values(["q", "word_score"], ascending=[True, False], kind="stable")
+        top = d.groupby("q")["word_score"].agg(["first", "size"])
+        second = d[d.groupby("q").cumcount() == 1].set_index("q")["word_score"]
+        margin = pd.Series(-1.0, index=qc)                      # no word hit -> weak
+        margin.loc[top.index] = top["first"] - second.reindex(top.index).fillna(0)
+        cut = np.quantile(margin.values, self.char_frac) if len(qc) else 0
+        weak = (margin.values <= cut)
+        if "non_latin" in Q.columns:
+            weak |= Q["non_latin"].values[qc].astype(bool)
+        return qc[weak]
+
+    def query(self, Q, k=20, q_chunk=200_000, view_k=None, verbose=False):
         """Returns DataFrame(q=row in Q, s1=row in S1, {view}_score, {view}_rank).
         view_k: optional {view: K} keeping only pairs within K of at least one view."""
         out = []
@@ -124,12 +154,16 @@ class Blocker:
                 continue
             rows, fitted = self.idx[c]
             qc = np.flatnonzero(Q["country"].values == c)
-            merged = None
+            merged, sub = None, qc
             for v, (col, _) in self.views.items():
+                t0 = time.time()
+                if merged is not None and v != "word" and self.char_frac < 1:
+                    if sub is qc:
+                        sub = self._weak(merged, Q, qc)
                 vec, X1T = fitted[v]
                 parts = []
-                for i in range(0, len(qc), q_chunk):
-                    qq = qc[i:i + q_chunk]
+                for i in range(0, len(sub), q_chunk):
+                    qq = sub[i:i + q_chunk]
                     C = sp_matmul_topn(vec.transform(Q[col].values[qq]), X1T, top_n=k,
                                        threshold=0.01, sort=True, n_threads=self.nt).tocoo()
                     parts.append(pd.DataFrame({"q": qq[C.row].astype(np.int32),
@@ -139,6 +173,8 @@ class Blocker:
                 d = d.sort_values(["q", f"{v}_score"], ascending=[True, False], kind="stable")
                 d[f"{v}_rank"] = (d.groupby("q").cumcount() + 1).astype(np.int16)
                 merged = d if merged is None else merged.merge(d, on=["q", "s1"], how="outer")
+                if verbose:
+                    print(f"  [{c}] view {v}: {len(sub):,} queries, {time.time() - t0:.0f}s", flush=True)
             out.append(merged)
         cols = ["q", "s1"] + [f"{v}_{s}" for v in self.views for s in ("score", "rank")]
         if not out:
@@ -271,11 +307,10 @@ def write_id_lists(s1_ids, pair_s1_ids, pair_q_ids, col, path):
 def block_all(blk, Q, out_prefix, chunk=1_000_000, k=20, view_k=VIEW_K, true_s1=None):
     """Blocks every row of Q in chunks, writing <out_prefix>_NNN.parquet (q = row in Q).
     If true_s1 (S1 row per Q row, NaN for decoys) is given, prints running recall."""
-    import time
     files, hit, tot = [], 0, 0
     for n, i in enumerate(range(0, len(Q), chunk)):
         t = time.time()
-        c = blk.query(Q.iloc[i:i + chunk], k=k, view_k=view_k)
+        c = blk.query(Q.iloc[i:i + chunk], k=k, view_k=view_k, verbose=True)
         c["q"] = (c["q"] + i).astype(np.int32)
         f = f"{out_prefix}_{n:03d}.parquet"
         c.to_parquet(f, index=False)
