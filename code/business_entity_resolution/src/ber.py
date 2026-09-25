@@ -288,3 +288,16 @@ def block_all(blk, Q, out_prefix, chunk=1_000_000, k=20, view_k=VIEW_K, true_s1=
             msg += f", recall so far {hit / max(tot, 1):.4f}"
         print(msg, flush=True)
     return files
+
+
+def write_pairs(s1_ids, q_ids, s1_rows, q_rows, col, path):
+    """Fast writer for large pair sets given integer rows into S1 / Q.
+    One row per S1 entity, comma-joined unique S2/S3 ids (empty when none)."""
+    key = np.unique(s1_rows.astype(np.int64) * len(q_ids) + q_rows.astype(np.int64))
+    s, q = key // len(q_ids), key % len(q_ids)
+    uniq, start = np.unique(s, return_index=True)
+    end = np.append(start[1:], len(s))
+    lists = np.full(len(s1_ids), "", dtype=object)
+    for u, a, b in zip(uniq, start, end):
+        lists[u] = ",".join(q_ids[q[a:b]])
+    pd.DataFrame({"source1_entity_id": s1_ids, col: lists}).to_csv(path, sep="\t", index=False)
