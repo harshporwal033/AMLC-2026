@@ -93,21 +93,61 @@ def load(path):
 
 
 # ---------------------------------------------------------------- blocking
-def make_views(word_max_df=0.02, char_max_df=0.05):
-    """max_df drops words / n-grams present in more than that share of S1 records of a
-    country. Very common features ("st", " rd", "ing") barely identify a business but make
-    the sparse top-K search very slow, because their posting lists cover most of the index.
-    The word view runs first (it is fastest and strongest); dict order matters."""
-    char3 = dict(analyzer="char_wb", ngram_range=(3, 3), min_df=2, max_df=char_max_df,
-                 sublinear_tf=True, dtype=np.float32)
-    word = dict(analyzer="word", token_pattern=r"\S+", min_df=1, max_df=word_max_df,
-                sublinear_tf=True, dtype=np.float32)
-    return {"word": ("both_n", word), "name": ("name_n", char3), "addr": ("addr_n", char3)}
+def make_views(word_max_df=0.02, char=False, char_max_df=0.05):
+    """Sparse TF-IDF views. max_df drops words / n-grams present in more than that share of
+    a country's S1 records: they barely identify a business but make the top-K search slow.
+    The char-3gram views are optional (slow on the full data; the dense view replaces them)."""
+    views = {"word": ("both_n", dict(analyzer="word", token_pattern=r"\S+", min_df=1,
+                                     max_df=word_max_df, sublinear_tf=True, dtype=np.float32))}
+    if char:
+        char3 = dict(analyzer="char_wb", ngram_range=(3, 3), min_df=2, max_df=char_max_df,
+                     sublinear_tf=True, dtype=np.float32)
+        views["name"] = ("name_n", char3)
+        views["addr"] = ("addr_n", char3)
+    return views
 
 
 VIEWS = make_views()
-VIEW_K = {"word": 10, "name": 5, "addr": 5}   # final candidate set fed to the model
+VIEW_K = {"word": 10, "emb": 10, "name": 5, "addr": 5}   # final candidate set (per view)
 CHAR_FRAC = 0.3   # share of queries (weakest word-view margin) that also get the char views
+EMB_MODEL = "intfloat/multilingual-e5-small"             # MIT licence, 118M parameters
+
+
+def emb_texts(df):
+    """Raw (not transliterated) text: the multilingual model reads Indic scripts directly."""
+    return ("query: " + df["business_name"].fillna("").astype(str) + " | "
+            + df["business_address"].fillna("").astype(str)).tolist()
+
+
+class Embedder:
+    """Mean-pooled, L2-normalised sentence embeddings (fp16 on GPU). Rows stay on device."""
+
+    def __init__(self, model=EMB_MODEL, device=None, batch=512, max_len=48):
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+        self.torch = torch
+        self.dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = torch.float16 if self.dev.startswith("cuda") else torch.float32
+        self.tok = AutoTokenizer.from_pretrained(model)
+        self.model = AutoModel.from_pretrained(model).to(self.dev).eval()
+        if self.dtype == torch.float16:
+            self.model.half()
+        self.dim, self.batch, self.max_len = self.model.config.hidden_size, batch, max_len
+
+    def encode(self, texts):
+        torch = self.torch
+        order = np.argsort([len(t) for t in texts], kind="stable")   # similar lengths per batch
+        out = torch.empty((len(texts), self.dim), dtype=self.dtype, device=self.dev)
+        with torch.inference_mode():
+            for i in range(0, len(texts), self.batch):
+                idx = order[i:i + self.batch]
+                b = self.tok([texts[j] for j in idx], padding=True, truncation=True,
+                             max_length=self.max_len, return_tensors="pt").to(self.dev)
+                h = self.model(**b).last_hidden_state
+                m = b["attention_mask"].unsqueeze(-1).to(h.dtype)
+                e = torch.nn.functional.normalize(((h * m).sum(1) / m.sum(1)).float(), dim=-1)
+                out[torch.as_tensor(idx, device=self.dev)] = e.to(self.dtype)
+        return out
 
 
 def _fit(params, docs):
@@ -120,18 +160,29 @@ def _fit(params, docs):
 
 
 class Blocker:
-    """Fits one TF-IDF index per (country, view) over S1; queries return top-k per view.
+    """Candidate generation per country: S2/S3 record -> top-k S1 records per view.
 
-    The word view is run for every query. The two char-3gram views (typos, transliteration,
-    junk names) are slower, so they only run for "weak" queries: non-Latin names, queries
-    with no word hit, and the char_frac share with the smallest word-view top1-top2 margin."""
+    word  sparse TF-IDF over rare words of name + address (CPU, every query)
+    emb   dense multilingual embeddings, exact top-k by cosine (GPU, every query); also
+          gives an exact emb_score for every candidate found by the other views
+    name/addr  optional char-3gram views, only for "weak" queries (see make_views)."""
 
-    def __init__(self, S1, views=VIEWS, n_threads=4, char_frac=CHAR_FRAC):
-        self.views, self.nt, self.char_frac, self.idx = views, n_threads, char_frac, {}
+    def __init__(self, S1, views=VIEWS, n_threads=4, char_frac=CHAR_FRAC, embedder=None,
+                 verbose=False):
+        self.views, self.nt, self.char_frac, self.embedder = views, n_threads, char_frac, embedder
+        self.idx, self.emb = {}, {}
+        self.s1_pos = np.full(len(S1), -1, np.int64)            # S1 row -> row within country
         for c in pd.unique(S1["country"]):
+            t0 = time.time()
             rows = np.flatnonzero(S1["country"].values == c)
+            self.s1_pos[rows] = np.arange(len(rows))
             self.idx[c] = (rows, {v: _fit(params, S1[col].values[rows])
                                   for v, (col, params) in views.items()})
+            if embedder is not None:
+                self.emb[c] = embedder.encode(emb_texts(S1.iloc[rows]))
+            if verbose:
+                print(f"  index [{c}] {len(rows):,} S1 records, {time.time() - t0:.0f}s", flush=True)
+        self.view_names = list(views) + (["emb"] if embedder is not None else [])
 
     def _weak(self, word_cand, Q, qc):
         d = word_cand.sort_values(["q", "word_score"], ascending=[True, False], kind="stable")
@@ -144,6 +195,38 @@ class Blocker:
         if "non_latin" in Q.columns:
             weak |= Q["non_latin"].values[qc].astype(bool)
         return qc[weak]
+
+    def _dense(self, Q, qc, c, merged, k, chunk=1024):
+        torch = self.embedder.torch
+        rows, S = self.idx[c][0], self.emb[c]
+        E = self.embedder.encode(emb_texts(Q.iloc[qc]))
+        kk = min(k, S.shape[0])
+        sc, ix = [], []
+        for j in range(0, len(qc), chunk):
+            s, i = (E[j:j + chunk] @ S.T).topk(kk, dim=1)
+            sc.append(s.float().cpu().numpy()); ix.append(i.cpu().numpy())
+        sc, ix = np.concatenate(sc), np.concatenate(ix)
+        d = pd.DataFrame({"q": np.repeat(qc, kk).astype(np.int32),
+                          "s1": rows[ix.ravel()].astype(np.int32),
+                          "emb_score": sc.ravel().astype(np.float32),
+                          "emb_rank": np.tile(np.arange(1, kk + 1, dtype=np.int16), len(qc))})
+        merged = d if merged is None else merged.merge(d, on=["q", "s1"], how="outer")
+        # exact cosine for candidates that only the other views found
+        miss = np.flatnonzero(merged["emb_score"].isna().values)
+        if len(miss):
+            qpos = np.empty(len(Q), np.int64); qpos[qc] = np.arange(len(qc))
+            qi = qpos[merged["q"].values[miss]]
+            si = self.s1_pos[merged["s1"].values[miss]]
+            vals = np.empty(len(miss), np.float32)
+            for j in range(0, len(miss), 1_000_000):
+                a = torch.as_tensor(qi[j:j + 1_000_000], device=E.device)
+                b = torch.as_tensor(si[j:j + 1_000_000], device=E.device)
+                vals[j:j + 1_000_000] = (E[a] * S[b]).sum(1).float().cpu().numpy()
+            col = merged["emb_score"].values.astype(np.float32)
+            col[miss] = vals
+            merged["emb_score"] = col
+        del E
+        return merged
 
     def query(self, Q, k=20, q_chunk=200_000, view_k=None, verbose=False):
         """Returns DataFrame(q=row in Q, s1=row in S1, {view}_score, {view}_rank).
@@ -175,18 +258,24 @@ class Blocker:
                 merged = d if merged is None else merged.merge(d, on=["q", "s1"], how="outer")
                 if verbose:
                     print(f"  [{c}] view {v}: {len(sub):,} queries, {time.time() - t0:.0f}s", flush=True)
+            if self.embedder is not None:
+                t0 = time.time()
+                merged = self._dense(Q, qc, c, merged, k)
+                if verbose:
+                    print(f"  [{c}] view emb: {len(qc):,} queries, {time.time() - t0:.0f}s", flush=True)
             out.append(merged)
-        cols = ["q", "s1"] + [f"{v}_{s}" for v in self.views for s in ("score", "rank")]
+        cols = ["q", "s1"] + [f"{v}_{s}" for v in self.view_names for s in ("score", "rank")]
         if not out:
             return pd.DataFrame(columns=cols)
         cand = pd.concat(out, ignore_index=True)
-        for v in self.views:
+        for v in self.view_names:
             cand[f"{v}_score"] = cand[f"{v}_score"].fillna(0).astype(np.float32)
             cand[f"{v}_rank"] = cand[f"{v}_rank"].fillna(999).astype(np.int16)
         if view_k:
             keep = np.zeros(len(cand), bool)
             for v, kk in view_k.items():
-                keep |= cand[f"{v}_rank"].values <= kk
+                if f"{v}_rank" in cand:
+                    keep |= cand[f"{v}_rank"].values <= kk
             cand = cand[keep]
         return cand[cols].sort_values(["q", "s1"]).reset_index(drop=True)
 
@@ -255,7 +344,7 @@ def build_features(cand, Q, S1, qstats):
     F["q_is_s3"] = Q["entity_id"].str.startswith("S3").values[qi]
 
     g = cand.groupby("q")
-    for v in ("word", "name", "addr"):
+    for v in [c[:-6] for c in cand.columns if c.endswith("_score")]:
         F[f"{v}_gap_best"] = cand[f"{v}_score"].values - g[f"{v}_score"].transform("max").values
     o = cand[["q", "word_score"]].sort_values(["q", "word_score"], ascending=[True, False])
     second = o[o.groupby("q").cumcount() == 1].set_index("q")["word_score"]

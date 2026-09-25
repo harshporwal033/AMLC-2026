@@ -6,3 +6,5 @@ anyascii==0.3.3
 sparse_dot_topn==1.2.0
 rapidfuzz>=3.6
 lightgbm>=4.0
+torch
+transformers
