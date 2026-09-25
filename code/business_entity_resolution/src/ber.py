@@ -295,6 +295,92 @@ def query_stats(Q, vocab):
     }).astype(np.float32).values
 
 
+LEGAL_CANON = {"private": "pvt", "pvt": "pvt", "pvtltd": "pvt", "limited": "ltd", "ltd": "ltd",
+               "llp": "llp", "llc": "llc", "inc": "inc", "incorporated": "inc", "corp": "corp",
+               "corporation": "corp", "co": "co", "company": "co", "lp": "lp", "pllc": "pllc",
+               "pc": "pc", "plc": "plc", "sa": "sa", "sas": "sas", "sarl": "sarl", "eurl": "eurl",
+               "gmbh": "gmbh"}
+_SINGLES = re.compile(r"\b[a-z](?: [a-z])+\b")            # "l l p" -> "llp", "o d" -> "od"
+
+
+def _collapse(s):
+    return _SINGLES.sub(lambda m: m.group(0).replace(" ", ""), s)
+
+
+def record_info(df, rows=None):
+    """Per-record fields for the decoy-sensitive pair features (computed once per frame).
+    legal: id of the set of canonical legal-form words in the raw name (0 = none)
+    core:  name tokens without legal words, single letters collapsed
+    nums:  address numbers with leading zeros stripped ("0049" -> "49")
+    rows: only fill these rows (others stay empty) to save time on a subset."""
+    n = len(df)
+    rows = np.arange(n) if rows is None else np.asarray(rows)
+    legal = np.zeros(n, np.int32)
+    core = np.full(n, "", dtype=object)
+    nums = np.full(n, "", dtype=object)
+    ids = {frozenset(): 0}
+    raw, nn, an = df["business_name"].values, df["name_n"].values, df["addr_n"].values
+    for i in rows:
+        toks = _collapse(base(raw[i])).split() if isinstance(raw[i], str) else []
+        key = frozenset(LEGAL_CANON[t] for t in toks if t in LEGAL_CANON)
+        legal[i] = ids.setdefault(key, len(ids))
+        core[i] = " ".join(t for t in _collapse(nn[i]).split() if t not in LEGAL)
+        nums[i] = " ".join(x.lstrip("0") or "0" for x in _NUMS.findall(an[i]))
+    return {"legal": legal, "core": core, "nums": nums, "legal_ids": ids}
+
+
+def _num_rel(a, b):
+    """0 missing, 1 equal, 2 truncated (prefix/suffix), 3 close (|diff|<=10), 4 different."""
+    if not a or not b:
+        return 0
+    if a == b:
+        return 1
+    if a.endswith(b) or b.endswith(a) or a.startswith(b) or b.startswith(a):
+        return 2
+    return 3 if abs(int(a[:15]) - int(b[:15])) <= 10 else 4
+
+
+def pair_extra(qi, si, qinfo, sinfo):
+    """Features aimed at the synthetic decoys: near-copies of an S1 record with a changed
+    house number, a changed legal form, or one name word swapped for a different word."""
+    n = len(qi)
+    ql, sl = qinfo["legal"][qi], sinfo["legal"][si]
+    out = {"legal_both": ((ql > 0) & (sl > 0)).astype(np.float32),
+           "legal_eq": ((ql == sl) & (ql > 0)).astype(np.float32),
+           "legal_diff": ((ql != sl) & (ql > 0) & (sl > 0)).astype(np.float32)}
+    q_extra = np.zeros(n, np.float32); s_extra = np.zeros(n, np.float32)
+    hard_sub = np.zeros(n, np.float32); soft_sub = np.zeros(n, np.float32)
+    sub_min_jw = np.ones(n, np.float32)
+    first_rel = np.zeros(n, np.float32); n_rel = np.zeros((n, 5), np.float32)
+    qc, sc = qinfo["core"][qi], sinfo["core"][si]
+    qn, sn = qinfo["nums"][qi], sinfo["nums"][si]
+    jw = JaroWinkler.normalized_similarity
+    for k in range(n):
+        qt, st = qc[k].split(), sc[k].split()
+        qs, ss = set(qt), set(st)
+        qx = [t for t in qt if t not in ss]
+        sx = [t for t in st if t not in qs]
+        q_extra[k], s_extra[k] = len(qx), len(sx)
+        for t in qx:
+            best = max((jw(t, u) for u in sx), default=0.0)
+            sub_min_jw[k] = min(sub_min_jw[k], best)
+            if best >= 0.8:
+                soft_sub[k] += 1
+            else:
+                hard_sub[k] += 1
+        a, b = qn[k].split(), sn[k].split()
+        if a and b:
+            first_rel[k] = _num_rel(a[0], b[0])
+            bs = set(b)
+            for x in a:                                   # best relation of each query number
+                n_rel[k, 1 if x in bs else min((_num_rel(x, y) for y in b), default=0)] += 1
+    out.update({"q_extra": q_extra, "s_extra": s_extra, "hard_sub": hard_sub, "soft_sub": soft_sub,
+                "sub_min_jw": sub_min_jw,
+                "first_rel": first_rel, "num_eq": n_rel[:, 1], "num_trunc": n_rel[:, 2],
+                "num_close": n_rel[:, 3], "num_far": n_rel[:, 4]})
+    return out
+
+
 def _cd(scorer, a, b):
     return process.cpdist(a, b, scorer=scorer, workers=-1).astype(np.float32)
 
@@ -302,8 +388,9 @@ def _cd(scorer, a, b):
 _NUMS = re.compile(r"\d+")
 
 
-def build_features(cand, Q, S1, qstats):
-    """cand must hold every candidate of each query it contains (group features)."""
+def build_features(cand, Q, S1, qstats, qinfo=None, sinfo=None):
+    """cand must hold every candidate of each query it contains (group features).
+    qinfo / sinfo (record_info of Q / S1) add the decoy-sensitive features."""
     qi, si = cand["q"].values, cand["s1"].values
     n = len(cand)
     qn, sn = Q["name_n"].values[qi], S1["name_n"].values[si]
@@ -346,12 +433,19 @@ def build_features(cand, Q, S1, qstats):
     g = cand.groupby("q")
     for v in [c[:-6] for c in cand.columns if c.endswith("_score")]:
         F[f"{v}_gap_best"] = cand[f"{v}_score"].values - g[f"{v}_score"].transform("max").values
-    o = cand[["q", "word_score"]].sort_values(["q", "word_score"], ascending=[True, False])
-    second = o[o.groupby("q").cumcount() == 1].set_index("q")["word_score"]
-    best = g["word_score"].transform("max").values
-    ws = cand["word_score"].values
-    F["word_margin"] = np.where(ws >= best, ws - cand["q"].map(second).fillna(0).values, ws - best)
+    for v in [c[:-6] for c in cand.columns if c.endswith("_score") and c[:-6] in ("word", "emb")]:
+        o = cand[["q", f"{v}_score"]].sort_values(["q", f"{v}_score"], ascending=[True, False])
+        second = o[o.groupby("q").cumcount() == 1].set_index("q")[f"{v}_score"]
+        best = g[f"{v}_score"].transform("max").values
+        ws = cand[f"{v}_score"].values
+        F[f"{v}_margin"] = np.where(ws >= best, ws - cand["q"].map(second).fillna(0).values, ws - best)
     F["q_ncand"] = g["s1"].transform("size").values
+    if qinfo is not None:
+        for k, v in pair_extra(qi, si, qinfo, sinfo).items():
+            F[k] = v
+        # ambiguity: how many candidates of this query look alike (same name / same address)
+        F["n_name_twins"] = (F["n_tsort"] >= 90).groupby(cand["q"].values).transform("sum").values
+        F["n_addr_twins"] = (F["a_tset"] >= 90).groupby(cand["q"].values).transform("sum").values
     return F.astype(np.float32)
 
 
@@ -430,7 +524,7 @@ def write_pairs(s1_ids, q_ids, s1_rows, q_rows, col, path):
 def best_per_query(cand, p):
     """One row per query: its highest-probability S1 (q, s1, p)."""
     d = pd.DataFrame({"q": cand["q"].values, "s1": cand["s1"].values,
-                      "p": np.asarray(p, dtype=np.float32)})
+                      "p": np.asarray(p, dtype=np.float32), "row": np.arange(len(cand))})
     return d.sort_values("p", ascending=False, kind="stable").drop_duplicates("q")
 
 
@@ -461,3 +555,45 @@ def decide_sets(top, p_min=0.05, power=1.0):
                                 best["m"].values, 0), index=best.index)
     d = d[d["m"].values <= d["s1"].map(keep_m).values]
     return d[["q", "s1", "p"]].reset_index(drop=True)
+
+
+def reverse_features(top):
+    """Stage-2 features: competition among the queries whose best S1 is the same S1.
+    top: one row per query (q, s1, p) over ALL queries (a complete claimant set per S1)."""
+    d = top[["q", "s1", "p"]].reset_index(drop=True)
+    g = d.groupby("s1")["p"]
+    o = d.sort_values(["s1", "p"], ascending=[True, False], kind="stable")
+    second = o[o.groupby("s1").cumcount() == 1].set_index("s1")["p"]
+    mx = g.transform("max").values
+    sec = d["s1"].map(second).fillna(0).values
+    p = d["p"].values
+    other = np.where(p >= mx, sec, mx)
+    return pd.DataFrame({
+        "rv_rank": g.rank(ascending=False, method="first").values,
+        "rv_n": g.transform("size").values,
+        "rv_n05": (d["p"] >= 0.5).groupby(d["s1"]).transform("sum").values,
+        "rv_sum_other": g.transform("sum").values - p,
+        "rv_max_other": other,
+        "rv_gap": p - other,
+    }, index=top.index).astype(np.float32)
+
+
+LGB_PARAMS = dict(objective="binary", learning_rate=0.1, num_leaves=127, min_data_in_leaf=200,
+                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
+                  verbose=-1, num_threads=4)
+
+
+def train_oof(F, y, groups, params=LGB_PARAMS, folds=3, rounds=600):
+    """Grouped out-of-fold LightGBM. Returns oof predictions, a final model on all rows."""
+    import lightgbm as lgb
+    from sklearn.model_selection import GroupKFold
+    oof, iters = np.zeros(len(F), np.float32), []
+    for fo, (tr, va) in enumerate(GroupKFold(folds).split(F, y, groups)):
+        m = lgb.train(params, lgb.Dataset(F.iloc[tr], y[tr]), rounds,
+                      valid_sets=[lgb.Dataset(F.iloc[va], y[va])],
+                      callbacks=[lgb.early_stopping(30, verbose=False)])
+        oof[va] = m.predict(F.iloc[va], num_iteration=m.best_iteration)
+        iters.append(m.best_iteration)
+        print(f"  fold {fo}: best iteration {m.best_iteration}", flush=True)
+    final = lgb.train(params, lgb.Dataset(F, y), max(int(np.mean(iters) * 1.1), 10))
+    return oof, final
