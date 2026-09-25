@@ -457,13 +457,18 @@ def assign(cand, p, thr):
     return top[top["p"] >= thr]
 
 
-def macro_f05(pred_s1, correct, true_cnt, eval_mask):
+def macro_f05(pred_s1, correct, true_cnt, eval_mask, fp_w=None):
     """pred_s1: S1 row of each assigned query; correct: bool per assignment;
-    true_cnt: #true matches per S1 row; eval_mask: S1 rows to average over."""
+    true_cnt: #true matches per S1 row; eval_mask: S1 rows to average over.
+    fp_w: optional weight per assignment for its false-positive cost (e.g. 1.9 for decoy
+    records, to mimic the test set, which has ~1.9x more decoys per S1 than train)."""
     n1 = len(true_cnt)
-    pred = np.bincount(pred_s1, minlength=n1)
     tp = np.bincount(pred_s1[correct], minlength=n1)
-    fp, fn = pred - tp, true_cnt - tp
+    wrong = ~np.asarray(correct)
+    fp = np.bincount(pred_s1[wrong], weights=None if fp_w is None else np.asarray(fp_w)[wrong],
+                     minlength=n1)
+    pred = tp + fp
+    fn = true_cnt - tp
     den = 1.25 * tp + 0.25 * fn + fp
     f = np.where(den == 0, 1.0, 1.25 * tp / np.maximum(den, 1e-9))
     m = eval_mask
@@ -583,17 +588,19 @@ LGB_PARAMS = dict(objective="binary", learning_rate=0.1, num_leaves=127, min_dat
                   verbose=-1, num_threads=4)
 
 
-def train_oof(F, y, groups, params=LGB_PARAMS, folds=3, rounds=600):
-    """Grouped out-of-fold LightGBM. Returns oof predictions, a final model on all rows."""
+def train_oof(F, y, groups, params=LGB_PARAMS, folds=3, rounds=600, weight=None):
+    """Grouped out-of-fold LightGBM. Returns oof predictions, a final model on all rows.
+    weight: optional per-row sample weight (e.g. up-weight decoy rows to the test prior)."""
     import lightgbm as lgb
     from sklearn.model_selection import GroupKFold
+    w = np.ones(len(F), np.float32) if weight is None else np.asarray(weight, np.float32)
     oof, iters = np.zeros(len(F), np.float32), []
     for fo, (tr, va) in enumerate(GroupKFold(folds).split(F, y, groups)):
-        m = lgb.train(params, lgb.Dataset(F.iloc[tr], y[tr]), rounds,
-                      valid_sets=[lgb.Dataset(F.iloc[va], y[va])],
+        m = lgb.train(params, lgb.Dataset(F.iloc[tr], y[tr], weight=w[tr]), rounds,
+                      valid_sets=[lgb.Dataset(F.iloc[va], y[va], weight=w[va])],
                       callbacks=[lgb.early_stopping(30, verbose=False)])
         oof[va] = m.predict(F.iloc[va], num_iteration=m.best_iteration)
         iters.append(m.best_iteration)
         print(f"  fold {fo}: best iteration {m.best_iteration}", flush=True)
-    final = lgb.train(params, lgb.Dataset(F, y), max(int(np.mean(iters) * 1.1), 10))
+    final = lgb.train(params, lgb.Dataset(F, y, weight=w), max(int(np.mean(iters) * 1.1), 10))
     return oof, final
