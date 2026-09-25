@@ -604,3 +604,24 @@ def train_oof(F, y, groups, params=LGB_PARAMS, folds=3, rounds=600, weight=None)
         print(f"  fold {fo}: best iteration {m.best_iteration}", flush=True)
     final = lgb.train(params, lgb.Dataset(F, y, weight=w), max(int(np.mean(iters) * 1.1), 10))
     return oof, final
+
+
+def second_per_query(cand, p):
+    """Runner-up S1 of each query: (q, s1_2, p2). Queries with one candidate get no row."""
+    d = pd.DataFrame({"q": cand["q"].values, "s1": cand["s1"].values,
+                      "p": np.asarray(p, dtype=np.float32)})
+    d = d.sort_values(["q", "p"], ascending=[True, False], kind="stable")
+    return d[d.groupby("q").cumcount() == 1].rename(columns={"s1": "s1_2", "p": "p2"})
+
+
+def second_choice_features(top, second):
+    """Stage-2 features about the query's runner-up S1: how strong it is, and whether that S1
+    is already claimed by a stronger query (if not, the runner-up may be the true match and
+    the top-1 a look-alike). top / second: best_per_query / second_per_query over ALL queries."""
+    claim_max = top.groupby("s1")["p"].max()
+    d = top[["q", "p"]].merge(second, on="q", how="left")
+    p2 = d["p2"].fillna(0).values
+    alt = d["s1_2"].map(claim_max).fillna(0).values
+    return pd.DataFrame({"p2": p2, "p_gap12": d["p"].values - p2,
+                         "alt_claim_max": alt, "alt_margin": p2 - alt},
+                        index=top.index).astype(np.float32)
