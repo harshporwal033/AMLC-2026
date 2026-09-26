@@ -50,7 +50,15 @@ def main():
     ap.add_argument("--bs", type=int, default=512)
     ap.add_argument("--max_len", type=int, default=96)
     ap.add_argument("--chunk", type=int, default=1_000_000)
+    ap.add_argument("--allow_cpu", action="store_true")
     args = ap.parse_args()
+    if not torch.cuda.is_available() and not args.allow_cpu:
+        raise SystemExit(
+            "No usable GPU: torch " + torch.__version__ + " (built for CUDA " + str(torch.version.cuda) + ") cannot use "
+            "this machine's GPU - usually the NVIDIA driver is older than this torch build needs. "
+            "Run `nvidia-smi`, read 'CUDA Version' (top right) and install a matching build, e.g. "
+            "python -m pip install torch --index-url https://download.pytorch.org/whl/cu121 "
+            "(cu118 / cu121 / cu124 / cu126). Use --allow_cpu only for a tiny smoke test.")
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cuda.matmul.allow_tf32 = True
 

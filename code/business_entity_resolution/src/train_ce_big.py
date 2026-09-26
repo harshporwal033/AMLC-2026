@@ -90,6 +90,7 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0, help="use only the first N pairs (smoke test)")
     ap.add_argument("--grad_ckpt", action="store_true", help="gradient checkpointing (big models)")
+    ap.add_argument("--allow_cpu", action="store_true")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -98,6 +99,13 @@ def main():
     def say(msg):
         print(msg, flush=True); log.write(msg + "\n"); log.flush()
 
+    if not torch.cuda.is_available() and not args.allow_cpu:
+        raise SystemExit(
+            "No usable GPU: torch " + torch.__version__ + " (built for CUDA " + str(torch.version.cuda) + ") cannot use "
+            "this machine's GPU - usually the NVIDIA driver is older than this torch build needs. "
+            "Run `nvidia-smi`, read 'CUDA Version' (top right) and install a matching build, e.g. "
+            "python -m pip install torch --index-url https://download.pytorch.org/whl/cu121 "
+            "(cu118 / cu121 / cu124 / cu126). Use --allow_cpu only for a tiny smoke test.")
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     bf16 = dev == "cuda" and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if bf16 else torch.float16
