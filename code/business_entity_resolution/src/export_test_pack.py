@@ -31,6 +31,10 @@ def main():
     S1 = pd.read_parquet(f"{prep}/test_s1.parquet", columns=cols)
     Q = pd.concat([pd.read_parquet(f"{prep}/test_s{k}.parquet", columns=cols) for k in (2, 3)], ignore_index=True)
     print(f"stage-1 {s1o} | prep {prep} | top {len(top):,} | second {len(sec):,}", flush=True)
+    sel = ber.band_mask(top["p"].values)
+    print(f"queries in band: {sel.mean():.3f} ({sel.sum():,} of {len(sel):,})", flush=True)
+    top = top[sel]
+    sec = sec[sec["q"].isin(top["q"])]
     ber.export_pair_pack(Q, S1, list(top["q"].values) + list(sec["q"].values),
                          list(top["s1"].values) + list(sec["s1_2"].values), f"{WORK}/test_pack")
 

@@ -1263,5 +1263,17 @@ def ce_features_from_scores(top, second, scores, cols):
     sec = second.rename(columns={"s1_2": "s1"})[["q", "s1"]].merge(s, on=["q", "s1"], how="left")
     c2 = top["q"].map(pd.Series(sec["v"].values, index=sec["q"].values)).values
     out = ce_features(c1.astype(np.float32), c2.astype(np.float32))
+    out.loc[np.isnan(c1), :] = np.nan          # not scored (outside the band) -> all NaN
     out.index = top.index
     return out
+
+
+def band_mask(p, band=None):
+    """Queries worth a big cross-encoder: stage-1 top-1 probability inside (lo, hi).
+    band: "lo,hi" string / tuple, or None / "none" for all queries. Env BER_BAND overrides."""
+    import os
+    band = os.environ.get("BER_BAND", band if band is not None else "0.02,0.995")
+    if band is None or str(band).lower() == "none":
+        return np.ones(len(p), bool)
+    lo, hi = (float(x) for x in (band.split(",") if isinstance(band, str) else band))
+    return (np.asarray(p) > lo) & (np.asarray(p) < hi)

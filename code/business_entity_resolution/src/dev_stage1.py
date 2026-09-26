@@ -45,6 +45,10 @@ def main():
     with open(f"{WORK}/dev_state.pkl", "wb") as fh:
         pickle.dump(state, fh, protocol=4)
     top, sec = r["top"], r["second"]
+    sel = ber.band_mask(top["p"].values)
+    print(f"queries in band: {sel.mean():.3f} ({sel.sum():,} of {len(sel):,})", flush=True)
+    top = top[sel]
+    sec = sec[sec["q"].isin(top["q"])]
     q = list(top["q"].values) + list(sec["q"].values)
     s = list(top["s1"].values) + list(sec["s1_2"].values)
     ber.export_pair_pack(D["Q"], D["S1"], q, s, f"{WORK}/dev_pack")
