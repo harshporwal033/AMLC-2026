@@ -1048,36 +1048,64 @@ def ce_crossfit(D, out_dir, per_query=4, folds=2, max_train=1_200_000, seed=0, *
 
 
 # ---------------------------------------------------------------- test prediction (two passes)
+_G = {}
+
+
+def _stage1_sub(rng):
+    """Stage-1 features + scores for one query range of the current block file."""
+    lo, hi = rng
+    sub = _G["c"].iloc[lo:hi].reset_index(drop=True)
+    F = build_features(sub, _G["Q"], _G["S1"], _G["qs"], _G["qinfo"], _G["sinfo"])[_G["f1"]]
+    p1 = _G["m"].predict(F, num_threads=_G["threads"])
+    tp = best_per_query(sub, p1)
+    return (tp[["q", "s1", "p"]], second_per_query(sub, p1),
+            F.iloc[tp["row"].values].reset_index(drop=True))
+
+
 def predict_test_stage1(files, Q, S1, m1, f1, out_dir, chunk_q=250_000):
-    """Stage-1 scoring of every test candidate. Saves (and returns) the top-1 row per query with
-    its stage-1 features, the runner-up per query, and the full candidate list."""
+    """Stage-1 scoring of every test candidate, RESUMABLE: each block file's result is saved
+    to out_dir/part_NNN_*.parquet as soon as it is done, and files already saved are skipped
+    on a re-run (same out_dir).
+    Saves / returns the top-1 row per query with its stage-1 features, the runner-up per query,
+    and the full candidate list (cand_s1.npy / cand_q.npy)."""
     import os
     os.makedirs(out_dir, exist_ok=True)
-    qs, qinfo, sinfo = query_stats(Q, name_vocab(S1)), record_info(Q), record_info(S1)
-    T, X, P2, Cs, Cq = [], [], [], [], []
-    for f in files:
+    t = time.time()
+    _G.clear()
+    _G.update(Q=Q, S1=S1, f1=list(f1), m=m1, threads=0)
+    _G["qs"], _G["qinfo"], _G["sinfo"] = query_stats(Q, name_vocab(S1)), record_info(Q), record_info(S1)
+    print(f"record info in {time.time() - t:.0f}s", flush=True)
+    names = ("top", "second", "X")
+    for n, f in enumerate(files):
+        paths = [f"{out_dir}/part_{n:03d}_{k}.parquet" for k in names]
+        if all(os.path.exists(p) for p in paths):
+            print(f"{os.path.basename(f)}: already done, skipped", flush=True)
+            continue
         t = time.time()
         c = pd.read_parquet(f)
         qv = c["q"].values
         uq = np.unique(qv)
+        ranges = []
         for j in range(0, len(uq), chunk_q):
-            lo = np.searchsorted(qv, uq[j])
-            hi = np.searchsorted(qv, uq[min(j + chunk_q, len(uq)) - 1], side="right")
-            sub = c.iloc[lo:hi].reset_index(drop=True)
-            F = build_features(sub, Q, S1, qs, qinfo, sinfo)[f1]
-            p1 = m1.predict(F)
-            tp = best_per_query(sub, p1)
-            P2.append(second_per_query(sub, p1))
-            X.append(F.iloc[tp["row"].values].reset_index(drop=True))
-            T.append(tp[["q", "s1", "p"]])
-        Cs.append(c["s1"].values); Cq.append(qv)
-        print(f"{os.path.basename(f)}: {len(c):,} pairs, {time.time() - t:.0f}s", flush=True)
-    top = pd.concat(T, ignore_index=True)
-    second = pd.concat(P2, ignore_index=True)
-    X = pd.concat(X, ignore_index=True)
+            ranges.append((int(np.searchsorted(qv, uq[j])),
+                           int(np.searchsorted(qv, uq[min(j + chunk_q, len(uq)) - 1], side="right"))))
+        _G["c"] = c
+        res = [_stage1_sub(r) for r in ranges]
+        for k, name in enumerate(names):
+            pd.concat([r[k] for r in res], ignore_index=True).to_parquet(paths[k] + ".tmp")
+        for p in paths:                                      # rename last: a crash never leaves half a part
+            os.replace(p + ".tmp", p)
+        print(f"{os.path.basename(f)}: {len(c):,} pairs, {time.time() - t:.0f}s  (saved part {n})", flush=True)
+        del c, res
+    _G.clear()
+    top = pd.concat([pd.read_parquet(f"{out_dir}/part_{n:03d}_top.parquet") for n in range(len(files))], ignore_index=True)
+    second = pd.concat([pd.read_parquet(f"{out_dir}/part_{n:03d}_second.parquet") for n in range(len(files))], ignore_index=True)
+    X = pd.concat([pd.read_parquet(f"{out_dir}/part_{n:03d}_X.parquet") for n in range(len(files))], ignore_index=True)
     top.to_parquet(f"{out_dir}/top1.parquet"); second.to_parquet(f"{out_dir}/second.parquet")
     X.to_parquet(f"{out_dir}/X1top.parquet")
-    np.save(f"{out_dir}/cand_s1.npy", np.concatenate(Cs)); np.save(f"{out_dir}/cand_q.npy", np.concatenate(Cq))
+    cs = [pd.read_parquet(f, columns=["q", "s1"]) for f in files]
+    np.save(f"{out_dir}/cand_s1.npy", np.concatenate([c["s1"].values for c in cs]))
+    np.save(f"{out_dir}/cand_q.npy", np.concatenate([c["q"].values for c in cs]))
     return top, second, X
 
 
