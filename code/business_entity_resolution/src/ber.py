@@ -1095,3 +1095,50 @@ def shrink_ce(model_dir):
     from transformers import AutoModelForSequenceClassification
     m = AutoModelForSequenceClassification.from_pretrained(model_dir, num_labels=1)
     m.half().save_pretrained(model_dir)
+
+
+def export_ce_pairs(block_files, prep_dir, true_s1, exclude_s1, out_path, frac=0.06, per_query=4,
+                    max_pairs=3_000_000, seed=1):
+    """Training pairs for a stronger cross-encoder from train entities NOT in the dev set
+    (so its dev scores are out-of-sample without cross-fitting and ONE model serves dev and
+    test). Picks a random `frac` of the non-dev S1, every query that has one of them as its
+    true match or in its top-2, and keeps true pairs + candidates within top-per_query.
+    Saves parquet with columns a (record text), b (S1 text), y."""
+    n1 = len(exclude_s1)
+    pool = np.flatnonzero(~exclude_s1)
+    sel = np.zeros(n1, bool)
+    sel[np.random.default_rng(seed).choice(pool, int(n1 * frac), replace=False)] = True
+    parts = []
+    for f in block_files:
+        c = pd.read_parquet(f, columns=["q", "s1", "word_rank", "emb_rank"])
+        tq = true_s1[c["q"].values]
+        is_true = c["s1"].values == tq
+        near = (c["word_rank"].values <= 2) | (c["emb_rank"].values <= 2)
+        tsel = np.isfinite(tq) & sel[np.nan_to_num(tq, nan=0).astype(np.int64)]
+        touch = np.unique(c["q"].values[(near & sel[c["s1"].values]) | tsel])
+        k = np.isin(c["q"].values, touch) & (is_true | (c["word_rank"].values <= per_query)
+                                             | (c["emb_rank"].values <= per_query))
+        parts.append(pd.DataFrame({"q": c["q"].values[k], "s1": c["s1"].values[k], "y": is_true[k]}))
+    P = pd.concat(parts, ignore_index=True)
+    pos, neg = P[P["y"]], P[~P["y"]]
+    neg = neg.sample(n=max(0, min(len(neg), max_pairs - len(pos))), random_state=seed)
+    P = pd.concat([pos, neg]).sample(frac=1, random_state=seed).reset_index(drop=True)
+    S1 = pd.read_parquet(f"{prep_dir}/train_s1.parquet", columns=["business_name", "business_address"])
+    Q = pd.concat([pd.read_parquet(f"{prep_dir}/train_s{k}.parquet", columns=["business_name", "business_address"])
+                   for k in (2, 3)], ignore_index=True)
+    out = pd.DataFrame({"a": ce_texts(Q, P["q"].values), "b": ce_texts(S1, P["s1"].values),
+                        "y": P["y"].values.astype(np.float32)})
+    out.to_parquet(out_path, index=False)
+    print(f"saved {len(out):,} pairs ({out['y'].mean():.2%} positive) from {sel.sum():,} S1 -> {out_path}")
+    return out
+
+
+def ce_features_for(D, model_dirs, bs=1024):
+    """Cross-encoder features for D['_run']['top'] with an out-of-sample model (no cross-fit)."""
+    r = D["_run"]
+    top, sec = r["top"], r["second"]
+    c1 = score_ce(model_dirs, ce_texts(D["Q"], top["q"].values), ce_texts(D["S1"], top["s1"].values), bs=bs)
+    s2 = score_ce(model_dirs, ce_texts(D["Q"], sec["q"].values), ce_texts(D["S1"], sec["s1_2"].values), bs=bs)
+    out = ce_features(c1, top["q"].map(pd.Series(s2, index=sec["q"].values)).values)
+    out.index = top.index
+    return out
