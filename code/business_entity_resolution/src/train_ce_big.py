@@ -172,7 +172,7 @@ def main():
     final = os.path.join(args.out, "final_fp16")
     model.half().save_pretrained(final); tok.save_pretrained(final)
     shutil.make_archive(final, "zip", args.out, "final_fp16")
-    say(f"done in {(time.time() - t0) / 60:.0f} min -> {final}.zip")
+    say(f"done in {(time.time() - t0) / 60:.1f} min ({step * args.bs / (time.time() - t0):,.0f} pairs/s overall) -> {final}.zip")
 
 
 if __name__ == "__main__":
