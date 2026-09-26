@@ -754,7 +754,8 @@ def run_two_stage(D, w_decoy=1.9, out_dir=None, params=LGB_PARAMS, verbose=True,
             print(f"saved {out_dir} -> stage {'2' if use2 else '1'}, rule {cfg['rule']}")
     # keep what error_report() needs
     D["_run"] = {"top": top, "p2": oof2, "mask": mask, "rule": cfg["rule"], "w_decoy": w_decoy,
-                 "stage2": use2}
+                 "stage2": use2, "X2": X2, "y2": y2, "w2": w2, "second": second_per_query(cand, oof1),
+                 "f1": float(f1), "f2": float(f2), "params": params, "rounds": rounds, "m1": m1}
     return cfg
 
 
@@ -845,3 +846,245 @@ def error_report(D, n_examples=0):
                     print(f"T  {str(S1['business_name'].values[int(tt)])[:40]!r:42} {str(S1['business_address'].values[int(tt)])[:60]}  (TRUE)")
         show(dq[buckets["right S1, rejected"]], "right S1 but rejected")
         show(a["q"].values[wrong & dec], "accepted decoy")
+
+
+# ---------------------------------------------------------------- stage-2 experiments
+def coherence_features(top, Q, S1, max_claim=12):
+    """Do the queries claiming the same S1 agree with EACH OTHER?  True copies of one business
+    share its details; a decoy (near-copy of a sibling business) often disagrees with the
+    group, or forms its own tight sub-group.  For every query, compared with the other
+    claimants of its top-1 S1 (strongest max_claim by p): max / mean name and address
+    similarity, and similarity to the strongest other claimant."""
+    d = top[["q", "s1", "p"]].reset_index(drop=True)
+    d["i"] = np.arange(len(d))
+    d = d.sort_values(["s1", "p"], ascending=[True, False], kind="stable")
+    d = d[d.groupby("s1").cumcount() < max_claim]
+    pr = d.merge(d, on="s1", suffixes=("", "_o"))
+    pr = pr[pr["q"].values != pr["q_o"].values]
+    out = pd.DataFrame(index=np.arange(len(top)))
+    cols = ["coh_n", "coh_name_max", "coh_name_mean", "coh_addr_max", "coh_addr_mean",
+            "coh_num_max", "coh_best_name", "coh_best_addr"]
+    for c in cols:
+        out[c] = 0.0
+    if len(pr):
+        qn, on = Q["name_n"].values[pr["q"].values], Q["name_n"].values[pr["q_o"].values]
+        qa, oa = Q["addr_n"].values[pr["q"].values], Q["addr_n"].values[pr["q_o"].values]
+        pr["ns"] = _cd(fuzz.token_sort_ratio, qn, on)
+        pr["as"] = _cd(fuzz.token_set_ratio, qa, oa)
+        pr["nm"] = np.fromiter((len(set(_NUMS.findall(a)) & set(_NUMS.findall(b))) > 0
+                                for a, b in zip(qa, oa)), np.float32, len(pr))
+        g = pr.groupby("i")
+        agg = pd.DataFrame({"coh_n": g.size(), "coh_name_max": g["ns"].max(), "coh_name_mean": g["ns"].mean(),
+                            "coh_addr_max": g["as"].max(), "coh_addr_mean": g["as"].mean(),
+                            "coh_num_max": g["nm"].max()})
+        best = pr.sort_values(["i", "p_o"], ascending=[True, False]).drop_duplicates("i").set_index("i")
+        agg["coh_best_name"], agg["coh_best_addr"] = best["ns"], best["as"]
+        out.loc[agg.index, cols] = agg[cols].values
+    out.index = top.index
+    return out.astype(np.float32)
+
+
+def stage2_again(D, extra=None, drop=(), params=None, label="STAGE 2 (new)", w_decoy=None):
+    """Retrain ONLY stage 2 on the stored stage-1 results of run_two_stage(D) - minutes, not an
+    hour.  extra: list of DataFrames aligned with D['_run']['top'] (e.g. coherence_features,
+    cross-encoder scores) appended as features; drop: feature names to remove.
+    Returns (test-like F0.5, rule, model, feature list)."""
+    r = D["_run"]
+    true_s1, dev, true_cnt = D["true_s1"], D["dev"], D["true_cnt"]
+    w = r["w_decoy"] if w_decoy is None else w_decoy
+    X2 = r["X2"]
+    if extra:
+        X2 = pd.concat([X2] + [e.reset_index(drop=True) for e in extra], axis=1)
+    X2 = X2.drop(columns=[c for c in drop if c in X2.columns])
+    m = r["mask"]
+    top = r["top"]
+    oof, model = train_oof(X2[m].reset_index(drop=True), r["y2"][m], top["s1"].values[m],
+                           params or r["params"], weight=r["w2"][m], rounds=r["rounds"])
+    t = top[m].assign(p=oof)
+
+    def score(a):
+        tq = true_s1[a["q"].values]
+        return macro_f05(a["s1"].values, a["s1"].values == tq, true_cnt, dev,
+                         fp_w=np.where(np.isfinite(tq), 1.0, w))[:3]
+    rules = [{"mode": "thr", "thr": float(x)} for x in np.round(np.arange(0.3, 0.96, 0.05), 2)]
+    rules += [{"mode": "sets", "power": pw} for pw in (1.0, 1.2, 1.5, 2.0)]
+    res = [(score(t[t["p"] >= ru["thr"]] if ru["mode"] == "thr" else decide_sets(t, power=ru["power"])), ru)
+           for ru in rules]
+    (f, P, R), rule = max(res, key=lambda x: x[0][0])
+    imp = pd.Series(model.feature_importance("gain"), index=X2.columns).sort_values(ascending=False)
+    print(f"{label}: test-like macro F0.5 {f:.4f} | P {P:.4f} R {R:.4f} | rule {rule} "
+          f"(baseline stage 2 {r['f2']:.4f})")
+    print("  top features:", (imp / imp.sum()).head(10).round(3).to_dict())
+    return f, rule, model, list(X2.columns)
+
+
+# ---------------------------------------------------------------- cross-encoder (GPU)
+def ce_texts(df, rows):
+    """Raw name | address (original script) for the cross-encoder."""
+    n = df["business_name"].fillna("").astype(str).values[rows]
+    a = df["business_address"].fillna("").astype(str).values[rows]
+    return [f"{x} | {y}" for x, y in zip(n, a)]
+
+
+class _CE:
+    def __init__(self, model_dir, max_len=96):
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        self.torch = torch
+        self.dev = "cuda" if torch.cuda.is_available() else "cpu"
+        self.tok = AutoTokenizer.from_pretrained(model_dir)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_dir, num_labels=1).to(self.dev)
+        self.par = torch.nn.DataParallel(self.model) if torch.cuda.device_count() > 1 else self.model
+        self.max_len = max_len
+
+    def enc(self, a, b):
+        return self.tok(a, b, padding=True, truncation=True, max_length=self.max_len,
+                        return_tensors="pt").to(self.dev)
+
+
+def train_ce(a, b, y, out_dir, base=EMB_MODEL, epochs=1, bs=64, lr=3e-5, max_len=96,
+             log_every=500, seed=0):
+    """Fine-tunes a cross-encoder (record text, S1 text) -> match logit with BCE."""
+    from transformers import get_linear_schedule_with_warmup
+    ce = _CE(base, max_len)
+    torch = ce.torch
+    n = len(y)
+    steps = epochs * ((n + bs - 1) // bs)
+    opt = torch.optim.AdamW(ce.model.parameters(), lr=lr, weight_decay=0.01)
+    sch = get_linear_schedule_with_warmup(opt, int(0.05 * steps), steps)
+    amp = ce.dev == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    lossf = torch.nn.BCEWithLogitsLoss()
+    rng = np.random.default_rng(seed)
+    ce.par.train()
+    step, run, t0 = 0, None, time.time()
+    for _ in range(epochs):
+        order = rng.permutation(n)
+        for i in range(0, n, bs):
+            idx = order[i:i + bs]
+            enc = ce.enc([a[j] for j in idx], [b[j] for j in idx])
+            yt = torch.as_tensor(np.asarray(y)[idx], dtype=torch.float32, device=ce.dev)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
+                logit = ce.par(**enc).logits.squeeze(-1)
+            loss = lossf(logit.float(), yt)
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(ce.model.parameters(), 1.0)
+            scaler.step(opt); scaler.update(); sch.step()
+            step += 1
+            run = loss.item() if run is None else 0.98 * run + 0.02 * loss.item()
+            if step % log_every == 0 or step == steps:
+                print(f"  step {step}/{steps} loss {run:.4f} ({time.time() - t0:.0f}s)", flush=True)
+    ce.model.save_pretrained(out_dir)
+    ce.tok.save_pretrained(out_dir)
+
+
+def score_ce(model_dirs, a, b, bs=1024, max_len=96):
+    """Mean logit over one or more cross-encoder model dirs. Length-sorted batches."""
+    if isinstance(model_dirs, str):
+        model_dirs = [model_dirs]
+    order = np.argsort([len(x) + len(y) for x, y in zip(a, b)], kind="stable")
+    out = np.zeros(len(a), np.float32)
+    for md in model_dirs:
+        ce = _CE(md, max_len)
+        torch = ce.torch
+        if ce.dev == "cuda":
+            ce.model.half()
+        ce.par.eval()
+        with torch.inference_mode():
+            for i in range(0, len(a), bs):
+                idx = order[i:i + bs]
+                lg = ce.par(**ce.enc([a[j] for j in idx], [b[j] for j in idx])).logits.squeeze(-1)
+                out[idx] += lg.float().cpu().numpy()
+        del ce
+    return out / len(model_dirs)
+
+
+def ce_features(ce1, ce2):
+    ce2 = np.where(np.isfinite(ce2), ce2, -10.0)
+    return pd.DataFrame({"ce1": ce1, "ce2": ce2, "ce_gap": ce1 - ce2}).astype(np.float32)
+
+
+def ce_crossfit(D, out_dir, per_query=4, folds=2, max_train=1_200_000, seed=0, **train_kw):
+    """Cross-fitted cross-encoder on a load_dev() set (after run_two_stage).
+    Each fold model is trained on the other folds' queries and scores its own queries'
+    top-1 and runner-up S1, so the stage-2 features are out-of-fold. Training pairs: all true
+    pairs + candidates within top-per_query of the word / emb views (capped at max_train).
+    Returns ce_features aligned with D['_run']['top']; fold models saved in out_dir/fold*."""
+    r = D["_run"]
+    cand, Q, S1, true_s1 = D["cand"], D["Q"], D["S1"], D["true_s1"]
+    rng = np.random.default_rng(seed)
+    g = np.where(np.isfinite(true_s1), true_s1, -(np.arange(len(Q)) + 1.0)).astype(np.int64)
+    ug, inv = np.unique(g, return_inverse=True)
+    qfold = rng.integers(0, folds, len(ug))[inv]
+    keep = cand["is_true"].values.copy()
+    for c in ("word_rank", "emb_rank"):
+        if c in cand:
+            keep |= cand[c].values <= per_query
+    pairs = cand.loc[keep, ["q", "s1", "is_true"]]
+    top, sec = r["top"], r["second"]
+    ce1 = np.full(len(top), np.nan, np.float32)
+    sec_s = pd.Series(np.nan, index=sec["q"].values, dtype=np.float32)
+    for f in range(folds):
+        tr = pairs[qfold[pairs["q"].values] != f]
+        pos, neg = tr[tr["is_true"]], tr[~tr["is_true"]]
+        n_neg = max(0, min(len(neg), max_train - len(pos)))
+        tr = pd.concat([pos, neg.sample(n=n_neg, random_state=seed)]).sample(frac=1, random_state=seed)
+        print(f"fold {f}: training on {len(tr):,} pairs ({tr['is_true'].mean():.2%} positive)", flush=True)
+        md = f"{out_dir}/fold{f}"
+        train_ce(ce_texts(Q, tr["q"].values), ce_texts(S1, tr["s1"].values),
+                 tr["is_true"].values.astype(np.float32), md, **train_kw)
+        m1 = qfold[top["q"].values] == f
+        ce1[m1] = score_ce(md, ce_texts(Q, top["q"].values[m1]), ce_texts(S1, top["s1"].values[m1]))
+        m2 = qfold[sec["q"].values] == f
+        sec_s.loc[sec["q"].values[m2]] = score_ce(md, ce_texts(Q, sec["q"].values[m2]),
+                                                  ce_texts(S1, sec["s1_2"].values[m2]))
+    ce2 = top["q"].map(sec_s).values.astype(np.float32)
+    out = ce_features(ce1, ce2)
+    out.index = top.index
+    return out
+
+
+# ---------------------------------------------------------------- test prediction (two passes)
+def predict_test_stage1(files, Q, S1, m1, f1, out_dir, chunk_q=250_000):
+    """Stage-1 scoring of every test candidate. Saves (and returns) the top-1 row per query with
+    its stage-1 features, the runner-up per query, and the full candidate list."""
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+    qs, qinfo, sinfo = query_stats(Q, name_vocab(S1)), record_info(Q), record_info(S1)
+    T, X, P2, Cs, Cq = [], [], [], [], []
+    for f in files:
+        t = time.time()
+        c = pd.read_parquet(f)
+        qv = c["q"].values
+        uq = np.unique(qv)
+        for j in range(0, len(uq), chunk_q):
+            lo = np.searchsorted(qv, uq[j])
+            hi = np.searchsorted(qv, uq[min(j + chunk_q, len(uq)) - 1], side="right")
+            sub = c.iloc[lo:hi].reset_index(drop=True)
+            F = build_features(sub, Q, S1, qs, qinfo, sinfo)[f1]
+            p1 = m1.predict(F)
+            tp = best_per_query(sub, p1)
+            P2.append(second_per_query(sub, p1))
+            X.append(F.iloc[tp["row"].values].reset_index(drop=True))
+            T.append(tp[["q", "s1", "p"]])
+        Cs.append(c["s1"].values); Cq.append(qv)
+        print(f"{os.path.basename(f)}: {len(c):,} pairs, {time.time() - t:.0f}s", flush=True)
+    top = pd.concat(T, ignore_index=True)
+    second = pd.concat(P2, ignore_index=True)
+    X = pd.concat(X, ignore_index=True)
+    top.to_parquet(f"{out_dir}/top1.parquet"); second.to_parquet(f"{out_dir}/second.parquet")
+    X.to_parquet(f"{out_dir}/X1top.parquet")
+    np.save(f"{out_dir}/cand_s1.npy", np.concatenate(Cs)); np.save(f"{out_dir}/cand_q.npy", np.concatenate(Cq))
+    return top, second, X
+
+
+def stage2_matrix(top, second, X, extra=()):
+    """Same column construction as run_two_stage / stage2_again."""
+    X2 = pd.concat([X.reset_index(drop=True), reverse_features(top).reset_index(drop=True),
+                    second_choice_features(top, second).reset_index(drop=True)], axis=1)
+    X2["p1"] = top["p"].values
+    if extra:
+        X2 = pd.concat([X2] + [e.reset_index(drop=True) for e in extra], axis=1)
+    return X2
