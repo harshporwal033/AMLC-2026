@@ -30,6 +30,10 @@ ROOTS = os.environ.get("BER_ROOTS", "/kaggle/input:/kaggle/working").split(":")
 sys.path.insert(0, WORK)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ber  # noqa: E402
+_missing = [f for f in ['ce_features_for', 'stage2_again'] if not hasattr(ber, f)]
+if _missing:
+    raise SystemExit(f"ber.py is an OLD version (missing {_missing}) - paste the latest ber.py into "
+                     f"{ber.__file__} and restart")
 
 
 def find(name):

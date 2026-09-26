@@ -18,6 +18,10 @@ sys.path.insert(0, WORK)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd  # noqa: E402
 import ber  # noqa: E402
+_missing = [f for f in ['stage2_again', 'ce_features_from_scores'] if not hasattr(ber, f)]
+if _missing:
+    raise SystemExit(f"ber.py is an OLD version (missing {_missing}) - paste the latest ber.py into "
+                     f"{ber.__file__} and restart")
 
 
 def find(name):
