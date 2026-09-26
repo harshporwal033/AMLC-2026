@@ -89,6 +89,7 @@ def main():
     ap.add_argument("--eval_every", type=int, default=2000)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0, help="use only the first N pairs (smoke test)")
+    ap.add_argument("--grad_ckpt", action="store_true", help="gradient checkpointing (big models)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -114,7 +115,12 @@ def main():
     say(f"pairs: train {len(tr):,} ({tr['y'].mean():.2%} positive), val {len(va):,}")
 
     tok = AutoTokenizer.from_pretrained(args.base)
+    if tok.pad_token is None:                          # decoder models (Qwen3 etc.)
+        tok.pad_token = tok.eos_token
     model = AutoModelForSequenceClassification.from_pretrained(args.base, num_labels=1).to(dev)
+    model.config.pad_token_id = tok.pad_token_id       # needed to pool the last real token
+    if args.grad_ckpt:
+        model.gradient_checkpointing_enable()
     collate = make_collate(tok, args.max_len)
     dl = DataLoader(Pairs(tr["a"].tolist(), tr["b"].tolist(), tr["y"].values.astype(np.float32)),
                     batch_size=args.bs, shuffle=True, num_workers=args.workers, collate_fn=collate,

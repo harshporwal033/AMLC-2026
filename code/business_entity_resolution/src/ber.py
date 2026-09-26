@@ -934,7 +934,10 @@ class _CE:
         self.torch = torch
         self.dev = "cuda" if torch.cuda.is_available() else "cpu"
         self.tok = AutoTokenizer.from_pretrained(model_dir)
+        if self.tok.pad_token is None:                 # decoder models (Qwen3 etc.)
+            self.tok.pad_token = self.tok.eos_token
         self.model = AutoModelForSequenceClassification.from_pretrained(model_dir, num_labels=1).to(self.dev)
+        self.model.config.pad_token_id = self.tok.pad_token_id
         self.par = torch.nn.DataParallel(self.model) if torch.cuda.device_count() > 1 else self.model
         self.max_len = max_len
 
