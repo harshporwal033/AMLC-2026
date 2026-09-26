@@ -1306,26 +1306,3 @@ def ensure_prep(split, roots, work, n_jobs=4):
             n = prep_file(f"{raw}/{split}_source{k}.tsv", dst, n_jobs=n_jobs)
             print(f"prepared {dst} ({n:,} rows, {time.time() - t:.0f}s)", flush=True)
     return out
-
-
-def test_prep_dir(roots, work):
-    """Folder with test_s1/2/3.parquet: an attached one if present, otherwise built from the raw
-    challenge files (test_source1/2/3.tsv under roots) into work/prep (~10-15 min, row order kept)."""
-    import glob
-    import os
-    for r in roots:
-        hits = sorted(glob.glob(f"{r}/**/test_s1.parquet", recursive=True))
-        if hits and all(os.path.exists(os.path.join(os.path.dirname(hits[0]), f"test_s{k}.parquet")) for k in (2, 3)):
-            return os.path.dirname(hits[0])
-    raw = [h for r in roots for h in sorted(glob.glob(f"{r}/**/test_source1.tsv", recursive=True))]
-    if not raw:
-        raise FileNotFoundError(f"neither test_s1.parquet nor the raw test_source1.tsv found under {roots} - "
-                                "attach the competition dataset")
-    src, out = os.path.dirname(raw[0]), f"{work}/prep"
-    os.makedirs(out, exist_ok=True)
-    for k in (1, 2, 3):
-        if not os.path.exists(f"{out}/test_s{k}.parquet"):
-            t = time.time()
-            n = prep_file(f"{src}/test_source{k}.tsv", f"{out}/test_s{k}.parquet")
-            print(f"prepared test_s{k}: {n:,} rows in {time.time() - t:.0f}s", flush=True)
-    return out
