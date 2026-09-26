@@ -39,6 +39,19 @@ def main():
     ap.add_argument("--allow_cpu", action="store_true")
     args = ap.parse_args()
 
+    # 0. the helper scripts must be the current versions (older ones lack Qwen / padding support)
+    need = {"train_ce_big.py": ["pad_token_id", "--allow_cpu", "pairs/s overall"],
+            "score_pairs.py": ["pad_token_id", "--allow_cpu"]}
+    for f, marks in need.items():
+        path = f"{HERE}/{f}"
+        if not os.path.exists(path):
+            sys.exit(f"FAILED [0]: {f} is missing - download it next to friend_check.py")
+        txt = open(path).read()
+        if not all(m in txt for m in marks):
+            sys.exit(f"FAILED [0]: {f} is an OLD version - download the latest from the repo "
+                     f"(code/business_entity_resolution/src/{f}) and run this check again")
+    print("[0] helper scripts are the current versions", flush=True)
+
     # 1. GPU
     import torch
     ok = torch.cuda.is_available()
