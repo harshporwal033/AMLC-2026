@@ -915,6 +915,7 @@ def stage2_again(D, extra=None, drop=(), params=None, label="STAGE 2 (new)", w_d
     print(f"{label}: test-like macro F0.5 {f:.4f} | P {P:.4f} R {R:.4f} | rule {rule} "
           f"(baseline stage 2 {r['f2']:.4f})")
     print("  top features:", (imp / imp.sum()).head(10).round(3).to_dict())
+    D["_last2"] = {"oof": oof, "X2": X2, "rule": rule, "f": f}
     return f, rule, model, list(X2.columns)
 
 
@@ -1142,3 +1143,63 @@ def ce_features_for(D, model_dirs, bs=1024):
     out = ce_features(c1, top["q"].map(pd.Series(s2, index=sec["q"].values)).values)
     out.index = top.index
     return out
+
+
+def ce_crossfit_score(D, fold_dirs, folds=2, seed=0):
+    """Rebuild ce_crossfit's out-of-fold features from its SAVED fold models (no retraining).
+    D must be the same load_dev(frac, seed) set the folds were trained on; the fold split is
+    re-derived from the same seed."""
+    r = D["_run"]
+    Q, S1, true_s1 = D["Q"], D["S1"], D["true_s1"]
+    rng = np.random.default_rng(seed)
+    g = np.where(np.isfinite(true_s1), true_s1, -(np.arange(len(Q)) + 1.0)).astype(np.int64)
+    ug, inv = np.unique(g, return_inverse=True)
+    qfold = rng.integers(0, folds, len(ug))[inv]
+    top, sec = r["top"], r["second"]
+    ce1 = np.full(len(top), np.nan, np.float32)
+    sec_s = pd.Series(np.nan, index=sec["q"].values, dtype=np.float32)
+    for f, md in enumerate(fold_dirs):
+        m1 = qfold[top["q"].values] == f
+        ce1[m1] = score_ce(md, ce_texts(Q, top["q"].values[m1]), ce_texts(S1, top["s1"].values[m1]))
+        m2 = qfold[sec["q"].values] == f
+        sec_s.loc[sec["q"].values[m2]] = score_ce(md, ce_texts(Q, sec["q"].values[m2]),
+                                                  ce_texts(S1, sec["s1_2"].values[m2]))
+    out = ce_features(ce1, top["q"].map(sec_s).values.astype(np.float32))
+    out.index = top.index
+    return out
+
+
+def stage3_features(top_masked, p2):
+    """Competition features recomputed with the (much better) stage-2 probabilities."""
+    t = top_masked[["q", "s1"]].assign(p=np.asarray(p2, np.float32))
+    R = reverse_features(t).add_prefix("s3_")
+    R["p2s"] = t["p"].values
+    return R.reset_index(drop=True)
+
+
+def stage3_again(D, params=None, label="STAGE 3"):
+    """Stage 3 = stage-2 features + competition among claimants re-scored with stage-2 p.
+    Run stage2_again(...) first (uses its out-of-fold p and feature matrix)."""
+    r, l2 = D["_run"], D["_last2"]
+    true_s1, dev, true_cnt, w = D["true_s1"], D["dev"], D["true_cnt"], r["w_decoy"]
+    m = r["mask"]
+    top = r["top"][m]
+    X3 = pd.concat([l2["X2"][m].reset_index(drop=True), stage3_features(top, l2["oof"])], axis=1)
+    oof, model = train_oof(X3, r["y2"][m], top["s1"].values, params or r["params"],
+                           weight=r["w2"][m], rounds=r["rounds"])
+    t = top.assign(p=oof)
+
+    def score(a):
+        tq = true_s1[a["q"].values]
+        return macro_f05(a["s1"].values, a["s1"].values == tq, true_cnt, dev,
+                         fp_w=np.where(np.isfinite(tq), 1.0, w))[:3]
+    rules = [{"mode": "thr", "thr": float(x)} for x in np.round(np.arange(0.3, 0.96, 0.05), 2)]
+    rules += [{"mode": "sets", "power": pw} for pw in (1.0, 1.2, 1.5, 2.0, 3.0)]
+    res = [(score(t[t["p"] >= ru["thr"]] if ru["mode"] == "thr" else decide_sets(t, power=ru["power"])), ru)
+           for ru in rules]
+    (f, P, R), rule = max(res, key=lambda x: x[0][0])
+    imp = pd.Series(model.feature_importance("gain"), index=X3.columns).sort_values(ascending=False)
+    print(f"{label}: test-like macro F0.5 {f:.4f} | P {P:.4f} R {R:.4f} | rule {rule} "
+          f"(stage 2 was {l2['f']:.4f})")
+    print("  top features:", (imp / imp.sum()).head(8).round(3).to_dict())
+    return f, rule, model, list(X3.columns)
