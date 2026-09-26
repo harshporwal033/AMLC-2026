@@ -46,8 +46,16 @@ def main():
     t0 = time.time()
     prep = os.path.dirname(find("test_s1.parquet"))
     blk = os.path.dirname(find("test_000.parquet"))
-    m3 = os.path.dirname(find("config2.json"))
-    m4 = os.path.dirname(find("config4.json"))
+    # stage-2 model: BER_STAGE2 (substring of its folder path) picks one when several are
+    # attached; otherwise the last in sorted order (model5 after model4). Stage-1 model: the
+    # config2.json in the same folder if present, else any attached one.
+    c4 = sorted(h for r in ROOTS for h in glob.glob(f"{r}/**/config4.json", recursive=True))
+    want = os.environ.get("BER_STAGE2", "")
+    c4 = [h for h in c4 if want in h] or c4
+    if not c4:
+        raise FileNotFoundError("config4.json not found")
+    m4 = os.path.dirname(c4[-1])
+    m3 = m4 if os.path.exists(f"{m4}/config2.json") else os.path.dirname(find("config2.json"))
     files = sorted(glob.glob(f"{blk}/test_*.parquet"))
     print(f"prep {prep}\nblocks {blk} ({len(files)} files)\nstage-1 model {m3}\nstage-2 model {m4}", flush=True)
 
