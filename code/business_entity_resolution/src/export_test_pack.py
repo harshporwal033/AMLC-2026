@@ -12,7 +12,7 @@ ROOTS = os.environ.get("BER_ROOTS", "/kaggle/input:/kaggle/working").split(":")
 sys.path.insert(0, WORK)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ber  # noqa: E402
-_missing = [f for f in ['export_pair_pack', 'band_mask'] if not hasattr(ber, f)]
+_missing = [f for f in ["ensure_prep", 'export_pair_pack', 'band_mask'] if not hasattr(ber, f)]
 if _missing:
     raise SystemExit(f"ber.py is an OLD version (missing {_missing}) - paste the latest ber.py into "
                      f"{ber.__file__} and restart")
@@ -28,7 +28,7 @@ def find(name):
 
 def main():
     s1o = os.path.dirname(find("test_stage1/top1.parquet"))
-    prep = os.path.dirname(find("test_s1.parquet"))
+    prep = ber.ensure_prep("test", ROOTS, WORK)
     top = pd.read_parquet(f"{s1o}/top1.parquet")
     sec = pd.read_parquet(f"{s1o}/second.parquet")
     cols = ["business_name", "business_address"]

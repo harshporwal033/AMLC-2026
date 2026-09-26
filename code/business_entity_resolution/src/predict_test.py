@@ -28,7 +28,7 @@ ROOTS = os.environ.get("BER_ROOTS", "/kaggle/input:/kaggle/working").split(":")
 sys.path.insert(0, WORK)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ber  # noqa: E402
-_missing = [f for f in ['predict_test_stage1', 'stage2_matrix', 'ce_features_from_scores', 'decide_sets'] if not hasattr(ber, f)]
+_missing = [f for f in ["ensure_prep", 'predict_test_stage1', 'stage2_matrix', 'ce_features_from_scores', 'decide_sets'] if not hasattr(ber, f)]
 if _missing:
     raise SystemExit(f"ber.py is an OLD version (missing {_missing}) - paste the latest ber.py into "
                      f"{ber.__file__} and restart")
@@ -48,8 +48,9 @@ def find(name, required=True):
 
 def main():
     t0 = time.time()
-    prep = os.path.dirname(find("test_s1.parquet"))
-    blk = os.path.dirname(find("test_000.parquet"))
+    prep = ber.ensure_prep("test", ROOTS, WORK)
+    blk_hit = find("test_000.parquet", required=False)
+    blk = os.path.dirname(blk_hit) if blk_hit else None
     # stage-2 model: BER_STAGE2 (substring of its folder path) picks one when several are
     # attached; otherwise the last in sorted order (model5 after model4). Stage-1 model: the
     # config2.json in the same folder if present, else any attached one.
@@ -60,7 +61,7 @@ def main():
         raise FileNotFoundError("config4.json not found")
     m4 = os.path.dirname(c4[-1])
     m3 = m4 if os.path.exists(f"{m4}/config2.json") else os.path.dirname(find("config2.json"))
-    files = sorted(glob.glob(f"{blk}/test_*.parquet"))
+    files = sorted(glob.glob(f"{blk}/test_*.parquet")) if blk else []
     print(f"prep {prep}\nblocks {blk} ({len(files)} files)\nstage-1 model {m3}\nstage-2 model {m4}", flush=True)
 
     S1 = ber.load(f"{prep}/test_s1.parquet")
@@ -83,6 +84,8 @@ def main():
         second = pd.read_parquet(f"{s1o}/second.parquet")
         X = pd.read_parquet(f"{s1o}/X1top.parquet")
     else:
+        if not files:
+            raise FileNotFoundError("no finished test_stage1/ and no test blocks (test_000.parquet) attached")
         top, second, X = ber.predict_test_stage1(files, Q, S1, m1, cfg3["f1"], s1o)
 
     # ---- stage 2 ----
