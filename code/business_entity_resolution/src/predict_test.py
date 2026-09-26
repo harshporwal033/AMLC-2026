@@ -60,9 +60,13 @@ def main():
     cfg3 = json.load(open(f"{m3}/config2.json"))
     m1 = lgb.Booster(model_file=f"{m3}/lgb1.txt")
     s1o = f"{WORK}/test_stage1"
-    if all(os.path.exists(f"{s1o}/{f}") for f in ("top1.parquet", "second.parquet", "X1top.parquet",
-                                                   "cand_s1.npy", "cand_q.npy")):
-        print("stage 1 already complete, loading", flush=True)
+    need = ("top1.parquet", "second.parquet", "X1top.parquet", "cand_s1.npy", "cand_q.npy")
+    done = [d for d in [s1o] + [os.path.dirname(h) for r in ROOTS
+                                for h in glob.glob(f"{r}/**/test_stage1/top1.parquet", recursive=True)]
+            if all(os.path.exists(f"{d}/{f}") for f in need)]
+    if done:
+        s1o = done[0]
+        print(f"stage 1 already complete, loading from {s1o}", flush=True)
         top = pd.read_parquet(f"{s1o}/top1.parquet")
         second = pd.read_parquet(f"{s1o}/second.parquet")
         X = pd.read_parquet(f"{s1o}/X1top.parquet")
