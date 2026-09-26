@@ -17,7 +17,9 @@ ROOTS = os.environ.get("BER_ROOTS", "/kaggle/input:/kaggle/working").split(":")
 sys.path.insert(0, WORK)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd  # noqa: E402
+import importlib  # noqa: E402
 import ber  # noqa: E402
+ber = importlib.reload(ber)  # %run in a live kernel would otherwise keep an older ber in memory
 _missing = [f for f in ['stage2_again', 'ce_features_from_scores'] if not hasattr(ber, f)]
 if _missing:
     raise SystemExit(f"ber.py is an OLD version (missing {_missing}) - paste the latest ber.py into "
