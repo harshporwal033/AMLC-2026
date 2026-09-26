@@ -687,7 +687,7 @@ def build_features_chunked(cand, Q, S1, qs, qinfo=None, sinfo=None, chunk_q=200_
     return pd.concat(parts, ignore_index=True)
 
 
-def run_two_stage(D, w_decoy=1.9, out_dir=None, params=LGB_PARAMS, verbose=True):
+def run_two_stage(D, w_decoy=1.9, out_dir=None, params=LGB_PARAMS, verbose=True, rounds=600):
     """Stage 1 (pair model) + stage 2 (competition / runner-up model) on a load_dev() set.
 
     Scores are "test-like": decoy false matches count w_decoy times (test has ~1.9x more
@@ -722,7 +722,7 @@ def run_two_stage(D, w_decoy=1.9, out_dir=None, params=LGB_PARAMS, verbose=True)
         return f, rule
 
     w1 = np.where(np.isfinite(tq_c), 1.0, w_decoy).astype(np.float32)
-    oof1, m1 = train_oof(F, y, grp, params, weight=w1)
+    oof1, m1 = train_oof(F, y, grp, params, weight=w1, rounds=rounds)
     top = best_per_query(cand, oof1)
     f1, rule1 = sweep(top, "STAGE 1")
 
@@ -737,7 +737,7 @@ def run_two_stage(D, w_decoy=1.9, out_dir=None, params=LGB_PARAMS, verbose=True)
     tq_t = true_s1[top["q"].values]
     w2 = np.where(np.isfinite(tq_t), 1.0, w_decoy).astype(np.float32)
     oof2, m2 = train_oof(X2[mask].reset_index(drop=True), y2[mask], top["s1"].values[mask], params,
-                         weight=w2[mask])
+                         weight=w2[mask], rounds=rounds)
     f2, rule2 = sweep(top[mask].assign(p=oof2), "STAGE 2")
     imp = pd.Series(m2.feature_importance("gain"), index=X2.columns).sort_values(ascending=False)
     if verbose:
@@ -752,4 +752,96 @@ def run_two_stage(D, w_decoy=1.9, out_dir=None, params=LGB_PARAMS, verbose=True)
         json.dump(cfg, open(f"{out_dir}/config2.json", "w"))
         if verbose:
             print(f"saved {out_dir} -> stage {'2' if use2 else '1'}, rule {cfg['rule']}")
+    # keep what error_report() needs
+    D["_run"] = {"top": top, "p2": oof2, "mask": mask, "rule": cfg["rule"], "w_decoy": w_decoy,
+                 "stage2": use2}
     return cfg
+
+
+def error_report(D, n_examples=0):
+    """Where does the dev score go? Needs run_two_stage(D) first.
+
+    Prints the test-like macro F0.5 of the current system and of three oracles:
+      A  perfect accept/reject of each query's current top-1 S1   (scoring ceiling)
+      B  perfect choice among ALL candidates of each query         (ranking ceiling)
+      C  B + blocking recall of 100% (every true pair available)   (= 1.0 by definition)
+    The gaps A-now, B-A, 1-B show whether to invest in the pair scorer, the ranking,
+    or candidate generation. Then error buckets by record type and country."""
+    r = D["_run"]
+    cand, Q, S1, true_s1, dev, true_cnt = (D[k] for k in ("cand", "Q", "S1", "true_s1", "dev", "true_cnt"))
+    w = r["w_decoy"]
+    top = r["top"][r["mask"]].copy()
+    if r["stage2"]:
+        top["p"] = r["p2"]
+    rule = r["rule"]
+    a = top[top["p"] >= rule["thr"]] if rule["mode"] == "thr" else decide_sets(top, power=rule["power"])
+
+    def f(a):
+        tq = true_s1[a["q"].values]
+        return macro_f05(a["s1"].values, a["s1"].values == tq, true_cnt, dev,
+                         fp_w=np.where(np.isfinite(tq), 1.0, w))
+
+    f_now, P, R, fv = f(a)
+    orA = top[top["s1"].values == true_s1[top["q"].values]]
+    t = cand[cand["is_true"].values]
+    orB = t[dev[t["s1"].values]]
+    print(f"NOW        test-like F0.5 {f_now:.4f}  (P {P:.4f} R {R:.4f})")
+    print(f"oracle A   perfect accept/reject of top-1      {f(orA)[0]:.4f}   <- pair-scoring ceiling")
+    print(f"oracle B   perfect pick among all candidates   {f(orB)[0]:.4f}   <- ranking ceiling")
+    print(f"oracle C   + perfect blocking                   1.0000")
+
+    # per-true-pair buckets (dev S1)
+    tq_all = true_s1
+    dq = np.flatnonzero(np.isfinite(tq_all)); dq = dq[dev[tq_all[dq].astype(np.int64)]]
+    found = np.zeros(len(Q), bool); found[t["q"].values] = True
+    topi = r["top"].set_index("q")
+    ts_ = topi.reindex(dq)
+    right = ts_["s1"].values == tq_all[dq]
+    acc = np.zeros(len(Q), bool); acc[a["q"].values] = True
+    buckets = {"not in candidates": ~found[dq], "top-1 is wrong S1": found[dq] & ~right,
+               "right S1, rejected": right & ~acc[dq], "matched": right & acc[dq]}
+    info = pd.DataFrame({"non_latin": Q["non_latin"].values[dq].astype(bool),
+                         "empty_addr": Q["addr_n"].values[dq] == "",
+                         "junk_name": D["qs"][dq, 0] == 0,
+                         "country": Q["country"].values[dq]})
+    print(f"\ntrue pairs of dev S1: {len(dq):,}")
+    rows = []
+    for k, m in buckets.items():
+        rows.append({"bucket": k, "n": m.sum(), "share": m.mean(),
+                     "non_latin": info["non_latin"][m].mean(), "empty_addr": info["empty_addr"][m].mean(),
+                     "junk_name": info["junk_name"][m].mean()})
+    rows.append({"bucket": "(all true pairs)", "n": len(dq), "share": 1.0, "non_latin": info["non_latin"].mean(),
+                 "empty_addr": info["empty_addr"].mean(), "junk_name": info["junk_name"].mean()})
+    print(pd.DataFrame(rows).round(4).to_string(index=False))
+
+    # false matches
+    tq = true_s1[a["q"].values]
+    wrong = a["s1"].values != tq
+    dec = ~np.isfinite(tq)
+    print(f"\naccepted {len(a):,} | wrong {wrong.sum():,} (decoys {(wrong & dec).sum():,}, other-S1 "
+          f"{(wrong & ~dec).sum():,}) | on singleton S1: {(wrong & (true_cnt[a['s1'].values] == 0)).sum():,}")
+    # decoy clusters: do decoys claiming the same S1 come in groups?
+    top_dec = top[~np.isfinite(true_s1[top["q"].values])]
+    per_s1 = top_dec.groupby("s1").size()
+    print(f"decoys claiming a dev S1: {len(top_dec):,} over {len(per_s1):,} S1 | "
+          f"S1 with >=2 decoy claimants: {(per_s1 >= 2).mean():.3f} | mean decoys per such S1: {per_s1.mean():.2f}")
+
+    sc = S1["country"].values[dev]
+    print("\nF0.5 by country:", pd.Series(fv[dev]).groupby(sc).mean().round(4).to_dict())
+    tc = true_cnt[dev]
+    print("F0.5 by #true matches of S1:", pd.Series(fv[dev]).groupby(np.minimum(tc, 6)).mean().round(4).to_dict())
+    print("share of dev S1 by #true matches:", pd.Series(np.minimum(tc, 6)).value_counts(normalize=True).sort_index().round(3).to_dict())
+
+    if n_examples:
+        rng = np.random.default_rng(0)
+        cs = cand.set_index(["q", "s1"])
+        def show(qs, title):
+            print(f"\n--- {title} ---")
+            for q in rng.choice(qs, min(n_examples, len(qs)), replace=False):
+                s = int(topi.loc[q, "s1"]); tt = true_s1[q]
+                print(f"Q  {str(Q['business_name'].values[q])[:40]!r:42} {str(Q['business_address'].values[q])[:60]}")
+                print(f"S1 {str(S1['business_name'].values[s])[:40]!r:42} {str(S1['business_address'].values[s])[:60]}  (top-1)")
+                if np.isfinite(tt) and int(tt) != s:
+                    print(f"T  {str(S1['business_name'].values[int(tt)])[:40]!r:42} {str(S1['business_address'].values[int(tt)])[:60]}  (TRUE)")
+        show(dq[buckets["right S1, rejected"]], "right S1 but rejected")
+        show(a["q"].values[wrong & dec], "accepted decoy")
