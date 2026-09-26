@@ -953,7 +953,7 @@ def train_ce(a, b, y, out_dir, base=EMB_MODEL, epochs=1, bs=64, lr=3e-5, max_len
     opt = torch.optim.AdamW(ce.model.parameters(), lr=lr, weight_decay=0.01)
     sch = get_linear_schedule_with_warmup(opt, int(0.05 * steps), steps)
     amp = ce.dev == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
     lossf = torch.nn.BCEWithLogitsLoss()
     rng = np.random.default_rng(seed)
     ce.par.train()
@@ -1088,3 +1088,10 @@ def stage2_matrix(top, second, X, extra=()):
     if extra:
         X2 = pd.concat([X2] + [e.reset_index(drop=True) for e in extra], axis=1)
     return X2
+
+
+def shrink_ce(model_dir):
+    """Re-save a trained cross-encoder in fp16 (half the download / upload size)."""
+    from transformers import AutoModelForSequenceClassification
+    m = AutoModelForSequenceClassification.from_pretrained(model_dir, num_labels=1)
+    m.half().save_pretrained(model_dir)
