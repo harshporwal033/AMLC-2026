@@ -1234,3 +1234,34 @@ def stage3_again(D, params=None, label="STAGE 3"):
           f"(stage 2 was {l2['f']:.4f})")
     print("  top features:", (imp / imp.sum()).head(8).round(3).to_dict())
     return f, rule, model, list(X3.columns)
+
+
+# ---------------------------------------------------------------- scoring on another machine
+def export_pair_pack(Q, S1, q_rows, s1_rows, out_dir):
+    """Text pairs for scoring elsewhere (e.g. a big GPU): writes out_dir/q.parquet (q, text),
+    s1.parquet (s1, text), pairs.parquet (q, s1) and zips out_dir. Row ids are positions in
+    the given Q / S1 frames; scores come back keyed by the same (q, s1)."""
+    import os
+    import shutil
+    os.makedirs(out_dir, exist_ok=True)
+    pr = pd.DataFrame({"q": np.asarray(q_rows, np.int64), "s1": np.asarray(s1_rows, np.int64)}).drop_duplicates()
+    uq, us = np.unique(pr["q"].values), np.unique(pr["s1"].values)
+    pd.DataFrame({"q": uq, "text": ce_texts(Q, uq)}).to_parquet(f"{out_dir}/q.parquet", index=False)
+    pd.DataFrame({"s1": us, "text": ce_texts(S1, us)}).to_parquet(f"{out_dir}/s1.parquet", index=False)
+    pr.to_parquet(f"{out_dir}/pairs.parquet", index=False)
+    shutil.make_archive(out_dir, "zip", os.path.dirname(out_dir) or ".", os.path.basename(out_dir))
+    print(f"pack {out_dir}: {len(pr):,} pairs, {len(uq):,} records, {len(us):,} S1 -> {out_dir}.zip")
+
+
+def ce_features_from_scores(top, second, scores, cols):
+    """Cross-encoder features (ce1, ce2, ce_gap) from precomputed scores (q, s1, <model cols>);
+    several cols are averaged. top / second: best_per_query / second_per_query."""
+    s = scores[["q", "s1"]].copy()
+    s["v"] = scores[list(cols)].mean(axis=1).astype(np.float32)
+    s = s.drop_duplicates(["q", "s1"])
+    c1 = top[["q", "s1"]].merge(s, on=["q", "s1"], how="left")["v"].values
+    sec = second.rename(columns={"s1_2": "s1"})[["q", "s1"]].merge(s, on=["q", "s1"], how="left")
+    c2 = top["q"].map(pd.Series(sec["v"].values, index=sec["q"].values)).values
+    out = ce_features(c1.astype(np.float32), c2.astype(np.float32))
+    out.index = top.index
+    return out

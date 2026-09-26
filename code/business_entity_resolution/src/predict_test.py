@@ -86,7 +86,16 @@ def main():
     m2 = lgb.Booster(model_file=f"{m4}/lgb2.txt")
     print(f"stage-2 variant {cfg4.get('variant')} | dev F0.5 {cfg4.get('dev_f05', float('nan')):.4f}", flush=True)
     extra = [ber.coherence_features(top, Q, S1)] if cfg4.get("coherence") else []
-    if cfg4.get("ce"):
+    if cfg4.get("ce_cols"):
+        # cross-encoder scores computed elsewhere (score_pairs.py on test_pack)
+        S = pd.read_parquet(find("test_scores.parquet"))
+        missing = [c for c in cfg4["ce_cols"] if c not in S.columns]
+        if missing:
+            raise KeyError(f"test_scores.parquet lacks model columns {missing}")
+        extra.append(ber.ce_features_from_scores(top, second, S, cfg4["ce_cols"]))
+        print(f"cross-encoder features from test_scores.parquet {cfg4['ce_cols']} "
+              f"(missing top-1 scores: {int(extra[-1]['ce1'].isna().sum()):,})", flush=True)
+    elif cfg4.get("ce"):
         dirs = [f"{m4}/{d}" for d in cfg4["ce"]]
         sel = np.ones(len(top), bool)
         if cfg4.get("ce_band"):
