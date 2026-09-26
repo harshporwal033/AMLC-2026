@@ -90,6 +90,10 @@ def main():
             raise FileNotFoundError("no finished test_stage1/ and no test blocks (test_000.parquet) attached")
         top, second, X = ber.predict_test_stage1(files, Q, S1, m1, cfg3["f1"], s1o)
 
+    if os.environ.get("BER_STAGE1_ONLY"):
+        print(f"BER_STAGE1_ONLY set: stage 1 saved in {s1o}, stopping before stage 2", flush=True)
+        return
+
     # ---- stage 2 ----
     cfg4 = json.load(open(f"{m4}/config4.json"))
     m2 = lgb.Booster(model_file=f"{m4}/lgb2.txt")
