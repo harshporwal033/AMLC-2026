@@ -93,7 +93,12 @@ One row per S2/S3 record (its top-1 S1), features = stage-1 features + p1 +
 - **cross-encoder** score of top-1 and runner-up and their gap.
 Trained on dev entities (complete claimant sets), grouped OOF by S1, decoys ×1.9.
 
-## 8. Decision rule
+## 8. Final ensemble and decision rule
+
+The submitted probabilities are the mean of two stage-2 models that share stage 1 and the
+candidate set: model4 (e5-small cross-encoder on all records, stage 2 on a 25% dev sample) and
+model6 (Qwen3 cross-encoder on uncertain records, stage 2 on the full dev set).
+
 
 Per S1, the accepted records are the top-m by stage-2 probability, where m (0…n) maximises the
 plug-in expected F0.5 of that S1 (m = 0 scores P(no true match) = ∏(1−p)); probabilities are
@@ -108,10 +113,15 @@ sharpened by a power tuned on dev. This treats a lone uncertain match on an othe
 | + decoy features, stage 2 (competition) | 0.9685 | 0.950 |
 | + coherence + e5 cross-encoder (25% dev sample) | 0.9832 | 0.973 |
 | full dev set, no cross-encoder | 0.9717 | – |
-| + Qwen3 cross-encoder | *fill in* | *fill in* |
+| full dev set + coherence | 0.9761 | – |
+| + Qwen3 cross-encoder on the uncertain third (model6) | 0.9856 | 0.970 |
+| **average of model4 and model6 stage-2 probabilities (final)** | – | **0.977** |
 
 Key contributions (dev): decoy-sensitive features +0.019; stage-2 competition +0.008;
-cross-encoder +0.011 (e5-small) / *fill in* (Qwen3).
+cross-encoder +0.011 (e5-small on all records) / +0.0095 (Qwen3 on the uncertain third).
+Coverage mattered more than cross-encoder strength: e5 on every record beat Qwen3 on a third of
+the records on the leaderboard, and averaging the two stage-2 models (same top-1 candidates,
+correlation 0.96) gave the best score.
 
 ## 10. Compliance
 
